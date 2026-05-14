@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Video } from "lucide-react";
+import { AlertTriangle, Video } from "lucide-react";
 import type { ServiceStatus } from "./types";
 import { api } from "./api";
 import { Header } from "./components/Header";
@@ -81,6 +81,13 @@ function Dashboard() {
   const selectedStream =
     status?.streams.find((s) => s.name === selected) ?? null;
 
+  // If we have never received a status, but have an error, the backend isn't
+  // reachable. Show a dedicated screen so the user gets actionable info
+  // instead of an empty dashboard that pretends nothing's wrong.
+  if (status === null && error) {
+    return <BackendUnreachable error={error} onRetry={refresh} />;
+  }
+
   return (
     <div className="h-full flex flex-col">
       <Header
@@ -90,8 +97,9 @@ function Dashboard() {
       />
 
       {error && (
-        <div className="bg-rose-500/10 border-b border-rose-500/30 text-rose-200 px-6 py-2 text-sm">
-          {error}
+        <div className="bg-rose-500/10 border-b border-rose-500/30 text-rose-200 px-6 py-2 text-sm flex items-center gap-2">
+          <AlertTriangle size={14} />
+          <span>Lost connection to backend: {error}</span>
         </div>
       )}
 
@@ -140,6 +148,48 @@ function Dashboard() {
         onClose={() => setAddOpen(false)}
         onSubmit={handleAddStream}
       />
+    </div>
+  );
+}
+
+function BackendUnreachable({
+  error,
+  onRetry,
+}: {
+  error: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="h-full flex items-center justify-center p-6">
+      <div className="max-w-md w-full card p-6">
+        <div className="flex items-center gap-3">
+          <div className="h-10 w-10 rounded-xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center">
+            <AlertTriangle size={18} className="text-rose-300" />
+          </div>
+          <h2 className="text-lg font-semibold tracking-tight">
+            Backend not reachable
+          </h2>
+        </div>
+        <p className="text-sm text-ink-300 mt-3 leading-relaxed">
+          The UI couldn&apos;t reach the recorder service. In development the
+          Vite dev server proxies <code className="font-mono text-ink-100">/api/*</code>{" "}
+          to <code className="font-mono text-ink-100">http://127.0.0.1:8765</code>{" "}
+          — make sure the backend is running:
+        </p>
+        <pre className="mt-3 bg-ink-950 border border-white/[0.06] rounded-lg px-3 py-2.5 text-xs font-mono text-ink-200 overflow-x-auto">
+          uv run rtsp-recorder
+        </pre>
+        <p className="text-xs text-ink-400 mt-3 leading-relaxed">
+          The dashboard polls automatically — it will recover as soon as the
+          backend is up. Last error:
+        </p>
+        <div className="mt-2 font-mono text-xs text-rose-300 bg-rose-500/10 border border-rose-500/20 rounded-md px-3 py-2 break-words">
+          {error}
+        </div>
+        <button className="btn-primary mt-5 w-full" onClick={onRetry}>
+          Retry now
+        </button>
+      </div>
     </div>
   );
 }

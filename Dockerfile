@@ -25,10 +25,10 @@ RUN pip install --no-cache-dir .
 
 ENV RTSP_RECORDER_DATA_DIR=/data \
     RTSP_RECORDER_HOST=0.0.0.0 \
-    RTSP_RECORDER_PORT=8000
+    RTSP_RECORDER_PORT=8765
 
 VOLUME ["/data"]
-EXPOSE 8000
+EXPOSE 8765
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["rtsp-recorder"]

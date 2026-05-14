@@ -6,7 +6,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-StreamState = Literal["stopped", "starting", "recording", "error"]
+StreamState = Literal[
+    "stopped",
+    "starting",
+    "recording",
+    "reconnecting",
+    "error",
+]
 
 
 class Stream(BaseModel):

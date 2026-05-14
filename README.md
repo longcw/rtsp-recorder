@@ -19,7 +19,7 @@ A small Python daemon that records one or more RTSP streams into rotating
 docker compose up --build -d
 ```
 
-Open <http://localhost:8000>. Recordings land in `./data/recordings/<stream>/`
+Open <http://localhost:8765>. Recordings land in `./data/recordings/<stream>/`
 on the host; the config (streams + retention) lives in `./data/config.json`.
 
 ## Local development
@@ -31,8 +31,11 @@ uv sync
 uv run rtsp-recorder
 ```
 
-The backend listens on `http://localhost:8000`. By default it stores data in
+The backend listens on `http://localhost:8765`. By default it stores data in
 `./data` — override with `RTSP_RECORDER_DATA_DIR=/path uv run rtsp-recorder`.
+Port 8000 is intentionally avoided because several common dev tools (Django,
+Cursor, etc.) squat on it; override with `RTSP_RECORDER_PORT=...` if 8765 is
+also taken.
 
 Frontend (Vite, with hot reload and `/api/*` proxied to the backend):
 
@@ -60,7 +63,7 @@ edited via the web UI or the REST API. There are no required env vars.
 |----------------------------|----------------|-------------------------------|
 | `RTSP_RECORDER_DATA_DIR`   | `./data`       | Where config + recordings go  |
 | `RTSP_RECORDER_HOST`       | `0.0.0.0`      | HTTP bind address             |
-| `RTSP_RECORDER_PORT`       | `8000`         | HTTP port                     |
+| `RTSP_RECORDER_PORT`       | `8765`         | HTTP port                     |
 | `RTSP_RECORDER_LOG_LEVEL`  | `INFO`         | Python log level              |
 
 ## REST API

@@ -15,6 +15,11 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 
+# tsc emit from composite tsconfig.node.json
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/*.tsbuildinfo
+
 # generated: built UI copied into the package
 src/rtsp_recorder/static/assets/
 src/rtsp_recorder/static/index.html

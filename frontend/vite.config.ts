@@ -10,7 +10,14 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://localhost:8000",
+      "/api": {
+        target: "http://127.0.0.1:8765",
+        changeOrigin: true,
+        // Don't pool sockets to the backend in dev. Uvicorn closes idle
+        // keep-alive sockets after a few seconds; without this the next
+        // request can race with that close and surface as "socket hang up".
+        agent: false,
+      },
     },
   },
   build: {

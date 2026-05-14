@@ -40,6 +40,9 @@ class StreamRecorder:
         self._last_error: str | None = None
         self._restart_count: int = 0
         self._current_file: str | None = None
+        # Once True, subsequent failures present as "reconnecting" rather than
+        # "error" so the UI can distinguish never-worked from lost-connection.
+        self._has_recorded: bool = False
 
     # ---- lifecycle ----
 
@@ -93,15 +96,15 @@ class StreamRecorder:
 
     async def _run(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
+        first_attempt = True
         while not self._stop.is_set():
-            self._state = "starting"
+            self._state = "starting" if first_attempt else "reconnecting"
             self._started_at = datetime.now(timezone.utc)
             try:
                 code = await self._run_ffmpeg_once()
             except Exception as e:  # pragma: no cover - defensive
                 logger.exception("recorder %s: unexpected error", self.stream.name)
                 self._last_error = f"unexpected: {e}"
-                self._state = "error"
                 code = -1
 
             if self._stop.is_set():
@@ -109,10 +112,15 @@ class StreamRecorder:
 
             if code == 0:
                 # ffmpeg exited cleanly without us asking — unusual for a live
-                # stream. Treat as an error condition so we retry.
+                # stream. Treat as a failure so we retry.
                 self._last_error = "ffmpeg exited cleanly; restarting"
-            self._state = "error"
+            self._current_file = None
+            # Have we ever successfully recorded? If so this is a reconnection
+            # attempt; if not, present as a hard error so the UI signals
+            # "configuration likely wrong."
+            self._state = "reconnecting" if self._has_recorded else "error"
             self._restart_count += 1
+            first_attempt = False
             try:
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=RESTART_BACKOFF_SECONDS
@@ -141,11 +149,19 @@ class StreamRecorder:
         try:
             code = await self._proc.wait()
         finally:
-            stderr_task.cancel()
+            # Drain remaining stderr before tearing down. ffmpeg's last lines
+            # (the failure cause, or the final segment-Opening) typically arrive
+            # right before exit; cancelling immediately would lose them and
+            # leave us with stale state. Cap the wait so a misbehaving child
+            # cannot wedge shutdown.
             try:
-                await stderr_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(stderr_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
                     "recorder %s: stderr task crashed", self.stream.name
@@ -177,14 +193,23 @@ class StreamRecorder:
             str(self.segment_seconds),
             "-segment_format",
             "mp4",
+            # Write each segment as a fragmented mp4 so it is playable while
+            # ffmpeg is still writing it (each fragment carries its own header).
+            # `empty_moov` writes an initial moov at the start of the file,
+            # `frag_keyframe` starts a new fragment on each keyframe, and
+            # `default_base_moof` keeps fragments self-contained.
+            # `flush_packets=1` forces the inner mp4 muxer to flush each
+            # fragment to disk; without it ffmpeg keeps the bytes in its
+            # seekable-file write buffer and the partial file stays
+            # unplayable until the segment closes.
+            "-segment_format_options",
+            "movflags=+empty_moov+default_base_moof+frag_keyframe:flush_packets=1",
             "-segment_atclocktime",
             "1",
             "-reset_timestamps",
             "1",
             "-strftime",
             "1",
-            "-movflags",
-            "+faststart",
             pattern,
         ]
 
@@ -207,6 +232,7 @@ class StreamRecorder:
             if opening:
                 self._current_file = Path(opening.group(1)).name
                 self._state = "recording"
+                self._has_recorded = True
                 self._last_error = None
             elif level in ("fatal", "error"):
                 self._last_error = body

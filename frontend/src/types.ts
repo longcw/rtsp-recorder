@@ -1,4 +1,9 @@
-export type StreamState = "stopped" | "starting" | "recording" | "error";
+export type StreamState =
+  | "stopped"
+  | "starting"
+  | "recording"
+  | "reconnecting"
+  | "error";
 
 export interface Stream {
   name: string;

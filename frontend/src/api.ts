@@ -2,12 +2,17 @@ import type { Config, RecordingFile, ServiceStatus, Stream } from "./types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    let detail: string;
+    // Read the body as text once, then optionally parse as JSON. The previous
+    // version called res.json() and res.text() in sequence which throws
+    // "body stream already read" because each fetch Response body can only
+    // be consumed once.
+    const text = await res.text().catch(() => "");
+    let detail: string = text;
     try {
-      const body = await res.json();
-      detail = body.detail ?? JSON.stringify(body);
+      const body = JSON.parse(text);
+      detail = body?.detail ?? text;
     } catch {
-      detail = await res.text();
+      // Not JSON — keep the raw text.
     }
     throw new Error(detail || `${res.status} ${res.statusText}`);
   }
