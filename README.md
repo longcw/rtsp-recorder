@@ -3,6 +3,8 @@
 A small Python daemon that records one or more RTSP streams into rotating
 1-minute MP4 files, with a polished web UI for managing it.
 
+![Screenshot](screenshot.png)
+
 ## Features
 
 - Subscribe to any number of RTSP streams
