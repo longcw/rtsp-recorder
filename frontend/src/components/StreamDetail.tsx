@@ -1,0 +1,301 @@
+import { useEffect, useState } from "react";
+import {
+  AlertTriangle,
+  Download,
+  Pause,
+  Play,
+  RotateCw,
+  Trash2,
+} from "lucide-react";
+import type { RecordingFile, StreamStatus } from "../types";
+import { api } from "../api";
+import { StatusDot, StateLabel } from "./StatusDot";
+import { useToast } from "./Toast";
+
+interface Props {
+  stream: StreamStatus;
+  onChanged: () => void;
+  onRemoved: () => void;
+}
+
+const FILE_POLL_MS = 5000;
+
+export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
+  const toast = useToast();
+  const [files, setFiles] = useState<RecordingFile[] | null>(null);
+  const [loadingFiles, setLoadingFiles] = useState(true);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+
+    async function tick() {
+      try {
+        const list = await api.listFiles(stream.name);
+        if (!active) return;
+        setFiles(list);
+      } catch (e) {
+        if (!active) return;
+        toast("error", e instanceof Error ? e.message : String(e));
+      } finally {
+        if (active) {
+          setLoadingFiles(false);
+          timer = window.setTimeout(tick, FILE_POLL_MS);
+        }
+      }
+    }
+    setLoadingFiles(true);
+    setFiles(null);
+    tick();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [stream.name, toast]);
+
+  async function toggleEnabled() {
+    setBusy(true);
+    try {
+      await api.patchStream(stream.name, { enabled: !stream.enabled });
+      onChanged();
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    setBusy(true);
+    try {
+      await api.removeStream(stream.name);
+      toast("success", `Removed ${stream.name}`);
+      onRemoved();
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  }
+
+  const totalSize = (files ?? []).reduce((a, b) => a + b.size, 0);
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="px-6 py-5 border-b border-white/[0.06]">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2.5">
+              <StatusDot state={stream.state} />
+              <h1 className="text-xl font-semibold tracking-tight truncate">
+                {stream.name}
+              </h1>
+              <StateLabel state={stream.state} />
+            </div>
+            <div className="font-mono text-xs text-ink-400 mt-2 truncate">
+              {stream.url}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              className="btn-ghost"
+              onClick={toggleEnabled}
+              disabled={busy}
+              title={stream.enabled ? "Disable" : "Enable"}
+            >
+              {stream.enabled ? <Pause size={15} /> : <Play size={15} />}
+              {stream.enabled ? "Disable" : "Enable"}
+            </button>
+            <button
+              className="btn-danger"
+              onClick={() => setConfirmDelete(true)}
+              disabled={busy}
+            >
+              <Trash2 size={15} />
+              Remove
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-5">
+          <Stat label="Current file" value={stream.current_file ?? "—"} mono />
+          <Stat
+            label="Started"
+            value={stream.started_at ? timeAgo(stream.started_at) : "—"}
+          />
+          <Stat label="Restarts" value={String(stream.restart_count)} />
+          <Stat
+            label="Recordings"
+            value={files ? `${files.length} (${formatBytes(totalSize)})` : "…"}
+          />
+        </div>
+
+        {stream.last_error && (
+          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-rose-500/20 bg-rose-500/10 px-3 py-2.5 text-sm text-rose-200">
+            <AlertTriangle size={15} className="mt-0.5 shrink-0" />
+            <div className="font-mono text-xs leading-snug">
+              {stream.last_error}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="flex-1 min-h-0 px-6 py-5 flex flex-col">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-ink-200">Recordings</h2>
+          <button
+            className="btn-ghost h-7 px-2 text-xs"
+            onClick={() => {
+              setLoadingFiles(true);
+              api
+                .listFiles(stream.name)
+                .then(setFiles)
+                .catch((e) => toast("error", String(e)))
+                .finally(() => setLoadingFiles(false));
+            }}
+          >
+            <RotateCw size={13} />
+            Refresh
+          </button>
+        </div>
+        <div className="card flex-1 min-h-0 overflow-y-auto">
+          {loadingFiles && files === null ? (
+            <div className="p-6 text-sm text-ink-400">Loading…</div>
+          ) : files && files.length === 0 ? (
+            <div className="p-6 text-sm text-ink-400">
+              No recordings yet. They will appear here once ffmpeg finalizes
+              the first segment (≈1 min).
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-ink-900/95 backdrop-blur border-b border-white/[0.06]">
+                <tr className="text-left">
+                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider">
+                    File
+                  </th>
+                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-32">
+                    Size
+                  </th>
+                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-40">
+                    Recorded
+                  </th>
+                  <th className="px-4 py-2.5 w-12" />
+                </tr>
+              </thead>
+              <tbody>
+                {(files ?? []).map((f) => (
+                  <tr
+                    key={f.name}
+                    className="border-b border-white/[0.04] last:border-0 hover:bg-white/[0.02]"
+                  >
+                    <td className="px-4 py-2.5 font-mono text-xs text-ink-100 truncate max-w-0">
+                      {f.name}
+                    </td>
+                    <td className="px-4 py-2.5 text-ink-300 tabular-nums">
+                      {formatBytes(f.size)}
+                    </td>
+                    <td className="px-4 py-2.5 text-ink-400 text-xs">
+                      {timeAgo(f.modified_at)}
+                    </td>
+                    <td className="px-2 py-1.5 text-right">
+                      <a
+                        href={api.fileUrl(stream.name, f.name)}
+                        download
+                        className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
+                        title="Download"
+                      >
+                        <Download size={14} />
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      {confirmDelete && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center p-4"
+          role="dialog"
+        >
+          <div
+            className="absolute inset-0 bg-ink-950/70 backdrop-blur-sm"
+            onClick={() => !busy && setConfirmDelete(false)}
+          />
+          <div className="relative card p-5 max-w-sm w-full">
+            <h3 className="text-base font-semibold">Remove stream?</h3>
+            <p className="text-sm text-ink-300 mt-2">
+              <span className="font-mono">{stream.name}</span> will stop
+              recording. Existing files on disk are <strong>not</strong>{" "}
+              deleted.
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                className="btn-ghost"
+                onClick={() => setConfirmDelete(false)}
+                disabled={busy}
+              >
+                Cancel
+              </button>
+              <button className="btn-danger" onClick={remove} disabled={busy}>
+                Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="card px-3.5 py-2.5">
+      <div className="text-[10px] uppercase tracking-wider text-ink-400 font-medium">
+        {label}
+      </div>
+      <div
+        className={`mt-1 text-sm text-ink-100 truncate ${mono ? "font-mono text-xs" : ""}`}
+        title={value}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
+}
+
+function timeAgo(iso: string): string {
+  const t = new Date(iso).getTime();
+  const diff = Math.max(0, Date.now() - t);
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}

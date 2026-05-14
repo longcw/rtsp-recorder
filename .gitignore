@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# data dirs
+data/
+recordings/
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# generated: built UI copied into the package
+src/rtsp_recorder/static/assets/
+src/rtsp_recorder/static/index.html
+
+# editor
+.vscode/
+.idea/
+.DS_Store

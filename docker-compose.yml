@@ -1,0 +1,12 @@
+services:
+  rtsp-recorder:
+    build: .
+    image: rtsp-recorder:latest
+    container_name: rtsp-recorder
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      - RTSP_RECORDER_DATA_DIR=/data
