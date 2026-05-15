@@ -79,6 +79,15 @@ class RecorderManager:
         await self.reconcile()
         return cfg
 
+    async def set_timezone(self, tz: str) -> Config:
+        cfg = await self.store.get()
+        cfg.timezone = tz
+        cfg = await self.store.update(cfg)
+        # Recorders need a restart so the new TZ propagates to ffmpeg's
+        # strftime (filenames).
+        await self.reconcile()
+        return cfg
+
     async def add_stream(self, stream: Stream) -> Config:
         cfg = await self.store.get()
         if any(s.name == stream.name for s in cfg.streams):
@@ -121,7 +130,7 @@ class RecorderManager:
             )
 
             # Stop recorders that should no longer be running, or whose
-            # config (url, segment length) has changed under them.
+            # config (url, segment length, timezone) has changed under them.
             stop_targets: list[StreamRecorder] = []
             for name, rec in list(self._recorders.items()):
                 wanted = desired.get(name)
@@ -130,6 +139,7 @@ class RecorderManager:
                     or not wanted.enabled
                     or wanted.url != rec.stream.url
                     or cfg.segment_seconds != rec.segment_seconds
+                    or cfg.timezone != rec.tz
                 ):
                     stop_targets.append(rec)
                     self._recorders.pop(name)
@@ -147,7 +157,10 @@ class RecorderManager:
                     # leave alone.
                     continue
                 rec = StreamRecorder(
-                    s, self.recordings_dir, cfg.segment_seconds
+                    s,
+                    self.recordings_dir,
+                    cfg.segment_seconds,
+                    cfg.timezone,
                 )
                 self._recorders[name] = rec
                 rec.start()
@@ -170,6 +183,7 @@ class RecorderManager:
             running=cfg.running,
             retention_days=cfg.retention_days,
             segment_seconds=cfg.segment_seconds,
+            timezone=cfg.timezone,
             streams=statuses,
         )
 

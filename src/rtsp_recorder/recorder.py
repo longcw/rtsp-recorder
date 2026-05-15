@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,15 +24,38 @@ logger = logging.getLogger(__name__)
 # stream just keeps logging restart attempts, which is fine.
 RESTART_BACKOFF_SECONDS = 5.0
 
+# Watchdog parameters.
+#
+# WATCHDOG_INTERVAL — how often we poll. Small enough to catch a hang quickly,
+# large enough not to be wasteful.
+#
+# WATCHDOG_HANG_SECONDS — if the current segment file's mtime hasn't advanced
+# in this long, ffmpeg has stopped writing data (e.g. the RTSP socket hung).
+# With `-flush_packets 1` mtime advances roughly per keyframe (1–2s for a
+# typical IP camera), so 30s is comfortably past any plausible jitter.
+#
+# WATCHDOG_BOUNDARY_GRACE — how late past an expected wall-clock cut we
+# tolerate before deciding `-segment_atclocktime` has stalled (the known
+# day-rollover behaviour). Only used for re-alignment; doesn't affect data
+# loss because case-1 stalls keep writing to the previous file.
+WATCHDOG_INTERVAL = 10.0
+WATCHDOG_HANG_SECONDS = 30.0
+WATCHDOG_BOUNDARY_GRACE = 10.0
+
 
 class StreamRecorder:
     """Manages one RTSP -> rotating mp4 ffmpeg subprocess."""
 
     def __init__(
-        self, stream: Stream, base_dir: Path, segment_seconds: int
+        self,
+        stream: Stream,
+        base_dir: Path,
+        segment_seconds: int,
+        tz: str,
     ) -> None:
         self.stream = stream
         self.segment_seconds = segment_seconds
+        self.tz = tz
         self.dir = base_dir / stream.name
         self._task: asyncio.Task[None] | None = None
         self._proc: asyncio.subprocess.Process | None = None
@@ -43,6 +68,11 @@ class StreamRecorder:
         # Once True, subsequent failures present as "reconnecting" rather than
         # "error" so the UI can distinguish never-worked from lost-connection.
         self._has_recorded: bool = False
+        # Wall-clock (epoch seconds) of the most recent "Opening … for writing"
+        # ffmpeg emitted — i.e. the start time of the current segment. Used by
+        # the watchdog to verify that rotation happened at each expected
+        # wall-clock boundary.
+        self._last_rotation_wall: float | None = None
 
     # ---- lifecycle ----
 
@@ -135,20 +165,33 @@ class StreamRecorder:
     async def _run_ffmpeg_once(self) -> int:
         pattern = str(self.dir / "%Y-%m-%d_%H-%M-%S.mp4")
         args = self._ffmpeg_args(pattern)
-        logger.info("recorder %s: starting ffmpeg", self.stream.name)
+        env = {**os.environ, "TZ": self.tz}
+        logger.info(
+            "recorder %s: starting ffmpeg (tz=%s)", self.stream.name, self.tz
+        )
+        # Clear the previous run's rotation timestamp; the watchdog will
+        # populate it when ffmpeg emits its first "Opening … for writing".
+        self._last_rotation_wall = None
         self._proc = await asyncio.create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         # Pump stderr in the background to track current file + last error and
         # avoid the pipe filling up.
         assert self._proc.stderr is not None
         stderr_task = asyncio.create_task(self._consume_stderr(self._proc.stderr))
+        watchdog_task = asyncio.create_task(self._watchdog())
         try:
             code = await self._proc.wait()
         finally:
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
             # Drain remaining stderr before tearing down. ffmpeg's last lines
             # (the failure cause, or the final segment-Opening) typically arrive
             # right before exit; cancelling immediately would lose them and
@@ -168,6 +211,90 @@ class StreamRecorder:
                 )
         logger.info("recorder %s: ffmpeg exited with code %s", self.stream.name, code)
         return code
+
+    async def _watchdog(self) -> None:
+        """Restart ffmpeg if it stops writing or misses a wall-clock cut.
+
+        Two independent checks run on each tick:
+
+        1. **Hang detection.** Stat the current segment file. If its mtime
+           has not advanced in ``WATCHDOG_HANG_SECONDS``, ffmpeg has stopped
+           writing data — typically a frozen RTSP socket that doesn't
+           propagate up as a process exit. This bounds the worst-case lost
+           footage in a hang to ``WATCHDOG_HANG_SECONDS`` + restart time.
+
+        2. **Rotation alignment.** If a wall-clock boundary that's a multiple
+           of ``segment_seconds`` since midnight passed more than
+           ``WATCHDOG_BOUNDARY_GRACE`` seconds ago and the last
+           ``Opening …`` line came in before that boundary, ffmpeg's
+           ``-segment_atclocktime`` is stalled (the known day-rollover bug).
+           Restart to re-align. No data loss in this case — ffmpeg was still
+           writing to the previous file — but the file would otherwise grow
+           past its intended duration.
+        """
+        while True:
+            try:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+            except asyncio.CancelledError:
+                return
+
+            now = time.time()
+
+            # Nothing to check until ffmpeg opens its first segment.
+            if self._current_file is None:
+                continue
+
+            # --- Check 1: hang detection via mtime of the current file. ---
+            current_path = self.dir / self._current_file
+            try:
+                mtime = current_path.stat().st_mtime
+            except FileNotFoundError:
+                # File just rotated and our cached name is one step behind;
+                # next tick will pick up the new file.
+                continue
+            mtime_age = now - mtime
+            if mtime_age > WATCHDOG_HANG_SECONDS:
+                logger.warning(
+                    "recorder %s: watchdog: %s hasn't grown in %.0fs; "
+                    "ffmpeg appears hung, restarting",
+                    self.stream.name,
+                    self._current_file,
+                    mtime_age,
+                )
+                self._terminate_proc()
+                return
+
+            # --- Check 2: missed wall-clock rotation. ---
+            if self._last_rotation_wall is not None:
+                most_recent_boundary = (
+                    int(now) // self.segment_seconds
+                ) * self.segment_seconds
+                missed = (
+                    most_recent_boundary > self._last_rotation_wall + 2.0
+                    and now - most_recent_boundary > WATCHDOG_BOUNDARY_GRACE
+                )
+                if missed:
+                    logger.warning(
+                        "recorder %s: watchdog: missed wall-clock rotation "
+                        "at %s (last opening %s); restarting to re-align",
+                        self.stream.name,
+                        time.strftime(
+                            "%H:%M:%S", time.localtime(most_recent_boundary)
+                        ),
+                        time.strftime(
+                            "%H:%M:%S",
+                            time.localtime(self._last_rotation_wall),
+                        ),
+                    )
+                    self._terminate_proc()
+                    return
+
+    def _terminate_proc(self) -> None:
+        if self._proc and self._proc.returncode is None:
+            try:
+                self._proc.terminate()
+            except ProcessLookupError:
+                pass
 
     def _ffmpeg_args(self, pattern: str) -> list[str]:
         return [
@@ -204,6 +331,12 @@ class StreamRecorder:
             # unplayable until the segment closes.
             "-segment_format_options",
             "movflags=+empty_moov+default_base_moof+frag_keyframe:flush_packets=1",
+            # Align cuts to wall-clock boundaries — for segment_seconds=300
+            # that's :00, :05, :10, …; for 3600 that's :00, 01:00, … This
+            # has a known stall around the day rollover where ffmpeg's
+            # seconds-since-midnight math fails to advance past the next
+            # boundary. The Python-side watchdog (see _watchdog) catches
+            # the stall and restarts ffmpeg so alignment recovers.
             "-segment_atclocktime",
             "1",
             "-reset_timestamps",
@@ -234,6 +367,7 @@ class StreamRecorder:
                 self._state = "recording"
                 self._has_recorded = True
                 self._last_error = None
+                self._last_rotation_wall = time.time()
             elif level in ("fatal", "error"):
                 self._last_error = body
             logger.debug("ffmpeg[%s][%s]: %s", self.stream.name, level, body)

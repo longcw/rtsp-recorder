@@ -8,6 +8,7 @@ import { StreamDetail } from "./components/StreamDetail";
 import { AddStreamDialog } from "./components/AddStreamDialog";
 import { RetentionCard } from "./components/RetentionCard";
 import { SegmentLengthCard } from "./components/SegmentLengthCard";
+import { TimezoneCard } from "./components/TimezoneCard";
 import { ToastProvider, useToast } from "./components/Toast";
 
 const STATUS_POLL_MS = 3000;
@@ -117,6 +118,10 @@ function Dashboard() {
             <>
               <SegmentLengthCard
                 segmentSeconds={status.segment_seconds}
+                onUpdate={refresh}
+              />
+              <TimezoneCard
+                timezone={status.timezone}
                 onUpdate={refresh}
               />
               <RetentionCard

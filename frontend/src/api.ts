@@ -66,4 +66,11 @@ export const api = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ segment_seconds }),
     }).then(json<Config>),
+
+  setTimezone: (timezone: string) =>
+    fetch("/api/config/timezone", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ timezone }),
+    }).then(json<Config>),
 };

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -38,9 +39,22 @@ class Config(BaseModel):
     # How long each rotating file is, in seconds. Default 5 minutes; bounded to
     # keep ffmpeg's segment muxer healthy and the file count reasonable.
     segment_seconds: int = Field(default=300, ge=10, le=3600)
+    # IANA timezone name. Used as the TZ env var for ffmpeg so that filenames
+    # (which use strftime) and any time-of-day logic are interpreted in this
+    # zone rather than the server's. Defaults to UTC.
+    timezone: str = Field(default="UTC")
     # Whether the recorder daemon is running. Persisted so the desired state
     # survives restarts.
     running: bool = True
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_tz(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError, OSError) as e:
+            raise ValueError(f"unknown timezone {v!r}: {e}") from e
+        return v
 
 
 class StreamStatus(BaseModel):
@@ -58,6 +72,7 @@ class ServiceStatus(BaseModel):
     running: bool
     retention_days: int
     segment_seconds: int
+    timezone: str
     streams: list[StreamStatus]
 
 

@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
@@ -44,6 +45,10 @@ class RetentionUpdate(BaseModel):
 
 class SegmentUpdate(BaseModel):
     segment_seconds: int
+
+
+class TimezoneUpdate(BaseModel):
+    timezone: str
 
 
 # ---- app factory ----
@@ -191,6 +196,17 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 detail="segment_seconds must be between 10 and 3600",
             )
         return await manager.set_segment_seconds(body.segment_seconds)
+
+    @app.put("/api/config/timezone", response_model=Config)
+    async def set_timezone(body: TimezoneUpdate) -> Config:
+        try:
+            ZoneInfo(body.timezone)
+        except (ZoneInfoNotFoundError, ValueError, OSError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown timezone {body.timezone!r}: {e}",
+            ) from e
+        return await manager.set_timezone(body.timezone)
 
     # ---- static frontend ----
 
