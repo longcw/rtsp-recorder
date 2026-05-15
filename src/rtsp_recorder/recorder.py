@@ -178,6 +178,12 @@ class StreamRecorder:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            # Default StreamReader buffer is 64 KiB. Some ffmpeg outputs
+            # (long parser warnings, codec hexdumps, occasional malformed
+            # bursts on broken streams) can exceed that and previously
+            # killed our stderr reader, blinding the watchdog to subsequent
+            # rotations. 1 MiB comfortably covers anything we've seen.
+            limit=1024 * 1024,
         )
         # Pump stderr in the background to track current file + last error and
         # avoid the pipe filling up.
@@ -353,7 +359,24 @@ class StreamRecorder:
 
     async def _consume_stderr(self, stream: asyncio.StreamReader) -> None:
         while True:
-            line = await stream.readline()
+            try:
+                line = await stream.readline()
+            except ValueError as e:
+                # StreamReader.readline raises ValueError (wrapping
+                # LimitOverrunError) when a single line exceeds the buffer
+                # limit. It has already cleared the offending bytes from
+                # the internal buffer by the time the exception lands, so
+                # we can recover by simply continuing. The cost is losing
+                # one log line; the alternative (letting the task die) was
+                # blinding the watchdog to all subsequent ffmpeg output —
+                # including the next rotation's "Opening" line, which then
+                # caused a spurious watchdog-triggered restart.
+                logger.warning(
+                    "recorder %s: stderr: dropped oversized line (%s)",
+                    self.stream.name,
+                    e,
+                )
+                continue
             if not line:
                 return
             text = line.decode(errors="replace").rstrip()
