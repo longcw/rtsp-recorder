@@ -4,6 +4,7 @@ import {
   Download,
   Pause,
   Play,
+  PlayCircle,
   RotateCw,
   Trash2,
 } from "lucide-react";
@@ -11,6 +12,7 @@ import type { RecordingFile, StreamStatus } from "../types";
 import { api } from "../api";
 import { StatusDot, StateLabel } from "./StatusDot";
 import { useToast } from "./Toast";
+import { VideoPlayerModal } from "./VideoPlayerModal";
 
 interface Props {
   stream: StreamStatus;
@@ -26,6 +28,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
   const [loadingFiles, setLoadingFiles] = useState(true);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [playing, setPlaying] = useState<RecordingFile | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -180,7 +183,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24">
                     Size
                   </th>
-                  <th className="px-4 py-2.5 w-12" />
+                  <th className="px-4 py-2.5 w-20" />
                 </tr>
               </thead>
               <tbody>
@@ -190,7 +193,8 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                   return (
                     <tr
                       key={f.name}
-                      className={`border-b border-white/[0.04] last:border-0 ${
+                      onClick={() => setPlaying(f)}
+                      className={`border-b border-white/[0.04] last:border-0 cursor-pointer ${
                         live
                           ? "bg-emerald-500/[0.04] hover:bg-emerald-500/[0.07]"
                           : "hover:bg-white/[0.02]"
@@ -238,14 +242,28 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                         {formatBytes(f.size)}
                       </td>
                       <td className="px-2 py-1.5 text-right">
-                        <a
-                          href={api.fileUrl(stream.name, f.name)}
-                          download
-                          className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
-                          title={live ? "Download in-progress copy" : "Download"}
-                        >
-                          <Download size={14} />
-                        </a>
+                        <div className="inline-flex items-center gap-0.5">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPlaying(f);
+                            }}
+                            className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
+                            title={live ? "Play (in progress)" : "Play"}
+                          >
+                            <PlayCircle size={15} />
+                          </button>
+                          <a
+                            href={api.fileUrl(stream.name, f.name)}
+                            download
+                            onClick={(e) => e.stopPropagation()}
+                            className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
+                            title={live ? "Download in-progress copy" : "Download"}
+                          >
+                            <Download size={14} />
+                          </a>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -255,6 +273,15 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
           )}
         </div>
       </div>
+
+      {playing && (
+        <VideoPlayerModal
+          streamName={stream.name}
+          file={playing}
+          live={playing.name === stream.current_file}
+          onClose={() => setPlaying(null)}
+        />
+      )}
 
       {confirmDelete && (
         <div
