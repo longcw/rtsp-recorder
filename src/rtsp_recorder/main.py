@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import AsyncIterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, RedirectResponse
+import re
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -67,6 +69,20 @@ class TimezoneUpdate(BaseModel):
 # ---- helpers ----
 
 _SEGMENT_NAME_FMT = "%Y-%m-%d_%H-%M-%S"
+
+# Single-range only. We don't bother with multi-range responses — browsers
+# only send a single bytes=N-M when streaming a <video>, and supporting
+# multipart/byteranges would require a substantially more involved encoder.
+_RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$")
+_RANGE_CHUNK = 64 * 1024
+
+
+def _range_not_satisfiable(file_size: int) -> StreamingResponse:
+    return StreamingResponse(
+        iter([b""]),
+        status_code=416,
+        headers={"Content-Range": f"bytes */{file_size}"},
+    )
 
 
 def _parse_segment_filename(name: str) -> datetime | None:
@@ -256,7 +272,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         return {"name": filename, "idle": body.idle}
 
     @app.get("/api/streams/{name}/files/{filename}")
-    async def download_file(name: str, filename: str):
+    async def download_file(name: str, filename: str, request: Request):
         if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
             raise HTTPException(status_code=400, detail="invalid filename")
         target = _resolve_stream_dir(name) / filename
@@ -266,7 +282,57 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="invalid path")
         if not target.is_file():
             raise HTTPException(status_code=404, detail="not found")
-        return FileResponse(target, media_type="video/mp4", filename=filename)
+
+        file_size = target.stat().st_size
+        range_header = request.headers.get("range")
+        if range_header:
+            m = _RANGE_RE.match(range_header.strip())
+            if not m:
+                # Per RFC 9110, an unparseable Range should be ignored, but
+                # we'd rather be explicit so misbehaving clients notice.
+                raise HTTPException(status_code=400, detail="invalid Range header")
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else file_size - 1
+            if start >= file_size or start > end:
+                return _range_not_satisfiable(file_size)
+            end = min(end, file_size - 1)
+            length = end - start + 1
+
+            def iter_range():
+                # Re-open + seek for each request; OS page cache handles
+                # the hot-path. Chunking caps memory and lets uvicorn flush
+                # progressively while the client buffers ahead.
+                with open(target, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        data = f.read(min(_RANGE_CHUNK, remaining))
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+
+            return StreamingResponse(
+                iter_range(),
+                status_code=206,
+                media_type="video/mp4",
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(length),
+                    # Keep the filename hint so explicit downloads still get
+                    # a nice name. The browser ignores Content-Disposition
+                    # for media elements, so <video> playback is unaffected.
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                },
+            )
+
+        return FileResponse(
+            target,
+            media_type="video/mp4",
+            filename=filename,
+            headers={"Accept-Ranges": "bytes"},
+        )
 
     # ---- retention / config ----
 
