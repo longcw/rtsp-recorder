@@ -44,6 +44,11 @@ export interface RecordingFile {
   duration_seconds: number | null;
   // Backend idle classification. null = not yet analyzed.
   idle: boolean | null;
+  // True while the analyzer is currently processing this file.
+  analyzing: boolean;
+  // Decode progress in [0,1] when analyzing; null otherwise (or when the
+  // duration probe failed so we have no denominator).
+  analyze_progress: number | null;
 }
 
 export interface Config {

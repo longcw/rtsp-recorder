@@ -40,6 +40,15 @@ class RecorderManager:
         self._analyze_task: asyncio.Task[None] | None = None
         self._analyze_stop = asyncio.Event()
         self._analyze_wake = asyncio.Event()
+        # (stream_name, filename) of the file currently being analyzed, or
+        # None when the analyzer is between files. Read by the API to mark
+        # the in-flight row in the UI; written only from `_analyze_pending`
+        # which runs on the same event loop so no lock is needed.
+        self._analyzing: tuple[str, str] | None = None
+        # Fraction in [0,1] of the current analysis. Updated from the
+        # decode-progress callback; resets to 0 each time `_analyzing`
+        # rolls to a new file.
+        self._analyze_progress: float = 0.0
 
     async def start(self) -> None:
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
@@ -271,6 +280,17 @@ class RecorderManager:
                 self._recorders[name] = rec
                 rec.start()
 
+    def analyzing_file(self, stream_name: str) -> tuple[str, float] | None:
+        """(filename, progress fraction) currently being analyzed in this
+        stream, or None when nothing is in flight here.
+        """
+        if self._analyzing is None:
+            return None
+        s, f = self._analyzing
+        if s != stream_name:
+            return None
+        return f, self._analyze_progress
+
     # ---- status ----
 
     async def status(self) -> ServiceStatus:
@@ -393,7 +413,21 @@ class RecorderManager:
                     continue
                 if now - st.st_mtime < ANALYZE_MIN_AGE_SECONDS:
                     continue
-                result = await analyze(f, motion_threshold=motion_threshold)
+                self._analyzing = (stream_dir.name, f.name)
+                self._analyze_progress = 0.0
+
+                def _on_progress(p: float) -> None:
+                    self._analyze_progress = p
+
+                try:
+                    result = await analyze(
+                        f,
+                        motion_threshold=motion_threshold,
+                        on_progress=_on_progress,
+                    )
+                finally:
+                    self._analyzing = None
+                    self._analyze_progress = 0.0
                 if result.idle is None and result.duration_seconds is None:
                     # Nothing usable came back (decode + probe both failed).
                     # Leave absent so we retry next tick.

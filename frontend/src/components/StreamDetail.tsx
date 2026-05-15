@@ -3,6 +3,7 @@ import {
   Activity,
   AlertTriangle,
   Download,
+  Loader2,
   Moon,
   Pause,
   Play,
@@ -25,6 +26,10 @@ interface Props {
 }
 
 const FILE_POLL_MS = 5000;
+// When any file is in flight or queued for analysis, poll faster so
+// the in-row progress % visibly ticks. Without this, a file that
+// finishes in <5s would never display its analyzing state.
+const FILE_POLL_MS_ACTIVE = 1500;
 
 export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
   const toast = useToast();
@@ -42,17 +47,21 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
     let timer: number | undefined;
 
     async function tick() {
+      let next = FILE_POLL_MS;
       try {
         const list = await api.listFiles(stream.name);
         if (!active) return;
         setFiles(list);
+        if (list.some((f) => f.analyzing || f.idle === null)) {
+          next = FILE_POLL_MS_ACTIVE;
+        }
       } catch (e) {
         if (!active) return;
         toast("error", e instanceof Error ? e.message : String(e));
       } finally {
         if (active) {
           setLoadingFiles(false);
-          timer = window.setTimeout(tick, FILE_POLL_MS);
+          timer = window.setTimeout(tick, next);
         }
       }
     }
@@ -294,13 +303,22 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                     >
                       <td className="px-4 py-2.5 max-w-0">
                         <div className="flex items-center gap-2 min-w-0">
-                          {live && (
+                          {live ? (
                             <span className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
                               <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse-dot" />
                               REC
                             </span>
-                          )}
-                          {!live && f.idle === true && (
+                          ) : f.analyzing ? (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-sky-500/10 border border-sky-400/25 text-sky-200 text-[10px] font-semibold uppercase tracking-wider shrink-0 tabular-nums"
+                              title="Analyzing this recording for motion."
+                            >
+                              <Loader2 size={10} className="animate-spin" />
+                              {f.analyze_progress != null
+                                ? `Scanning ${Math.round(f.analyze_progress * 100)}%`
+                                : "Scanning"}
+                            </span>
+                          ) : f.idle === true ? (
                             <span
                               className="inline-flex items-center gap-1 pl-1.5 pr-0.5 h-5 rounded-md bg-indigo-500/10 border border-indigo-400/25 text-indigo-200 text-[10px] font-semibold uppercase tracking-wider shrink-0"
                               title="No motion detected. Will be pruned on the idle retention schedule. Click X if this is wrong."
@@ -320,8 +338,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                                 <X size={10} />
                               </button>
                             </span>
-                          )}
-                          {!live && f.idle === false && (
+                          ) : f.idle === false ? (
                             <span
                               className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-amber-400/8 border border-amber-400/20 text-amber-200/90 text-[10px] font-semibold uppercase tracking-wider shrink-0"
                               title="Motion detected. Kept on the regular retention schedule."
@@ -329,7 +346,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                               <Activity size={10} />
                               Action
                             </span>
-                          )}
+                          ) : null}
                           <div className="min-w-0">
                             <div className="text-ink-100 tabular-nums truncate">
                               {range.primary}

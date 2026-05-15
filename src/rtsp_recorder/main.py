@@ -197,6 +197,9 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             return []
         tz = ZoneInfo(cfg.timezone)
         idle_data = idle_index.load(target)
+        analyzing_now = manager.analyzing_file(name)
+        analyzing_name = analyzing_now[0] if analyzing_now else None
+        analyzing_progress = analyzing_now[1] if analyzing_now else None
         files: list[RecordingFile] = []
         for f in target.iterdir():
             if not f.is_file():
@@ -228,6 +231,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             cached_duration = entry.get("duration") if isinstance(entry, dict) else None
             if isinstance(cached_duration, (int, float)) and cached_duration >= 0:
                 duration_seconds = float(cached_duration)
+            is_analyzing = (f.name == analyzing_name)
             files.append(
                 RecordingFile(
                     name=f.name,
@@ -236,6 +240,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                     started_at=started_at_naive,
                     duration_seconds=duration_seconds,
                     idle=idle if isinstance(idle, bool) else None,
+                    analyzing=is_analyzing,
+                    analyze_progress=analyzing_progress if is_analyzing else None,
                 )
             )
         files.sort(key=lambda r: r.name, reverse=True)
