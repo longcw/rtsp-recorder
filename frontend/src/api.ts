@@ -95,6 +95,12 @@ export const api = {
       { method: "POST" },
     ).then(json<{ name: string }>),
 
+  deleteFile: (stream: string, file: string) =>
+    fetch(
+      `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}`,
+      { method: "DELETE" },
+    ).then(json<{ name: string; deleted: boolean }>),
+
   setSegmentSeconds: (segment_seconds: number) =>
     fetch("/api/config/segment-seconds", {
       method: "PUT",

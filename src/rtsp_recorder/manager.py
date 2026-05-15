@@ -117,6 +117,24 @@ class RecorderManager:
         # pruner so the change is visible quickly.
         self._prune_wake.set()
 
+    async def delete_file(self, stream_name: str, filename: str) -> None:
+        """Delete one recording file and drop its idle-index entry."""
+        target_dir = self.recordings_dir / stream_name
+        target = target_dir / filename
+        if not target.is_file():
+            raise KeyError(f"file '{filename}' not found in stream '{stream_name}'")
+
+        def _delete() -> None:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            data = idle_index.load(target_dir)
+            if data.pop(filename, None) is not None:
+                idle_index.save(target_dir, data)
+
+        await asyncio.to_thread(_delete)
+
     async def reanalyze_file(self, stream_name: str, filename: str) -> None:
         """Drop one file's entry from its stream's idle index. The analyzer
         will pick it up on its next wake.

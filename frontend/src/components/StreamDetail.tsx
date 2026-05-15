@@ -33,6 +33,9 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
   const [playing, setPlaying] = useState<RecordingFile | null>(null);
+  const [confirmDeleteFile, setConfirmDeleteFile] =
+    useState<RecordingFile | null>(null);
+  const [deletingFile, setDeletingFile] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -71,6 +74,24 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
       toast("error", e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function deleteFile(file: RecordingFile) {
+    setDeletingFile(true);
+    // Optimistic: remove from the list immediately so the modal can close
+    // without a poll round-trip first.
+    const prev = files;
+    setFiles((cur) => (cur ? cur.filter((x) => x.name !== file.name) : cur));
+    try {
+      await api.deleteFile(stream.name, file.name);
+      toast("success", `Deleted ${file.name}`);
+      setConfirmDeleteFile(null);
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+      setFiles(prev);
+    } finally {
+      setDeletingFile(false);
     }
   }
 
@@ -254,7 +275,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24 hidden sm:table-cell">
                     Size
                   </th>
-                  <th className="px-2 py-2.5 w-36" />
+                  <th className="px-2 py-2.5 w-44" />
                 </tr>
               </thead>
               <tbody>
@@ -390,6 +411,19 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                           >
                             <Download size={14} />
                           </a>
+                          {!live && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setConfirmDeleteFile(f);
+                              }}
+                              className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-rose-500/15 text-ink-400 hover:text-rose-300"
+                              title="Delete recording"
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -400,6 +434,43 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
           )}
         </div>
       </div>
+
+      {confirmDeleteFile && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center p-4"
+          role="dialog"
+        >
+          <div
+            className="absolute inset-0 bg-ink-950/70 backdrop-blur-sm"
+            onClick={() => !deletingFile && setConfirmDeleteFile(null)}
+          />
+          <div className="relative card p-5 max-w-sm w-full">
+            <h3 className="text-base font-semibold">Delete recording?</h3>
+            <p className="text-sm text-ink-300 mt-2 break-words">
+              <span className="font-mono text-xs">{confirmDeleteFile.name}</span>
+              <span className="block text-ink-400 mt-1.5">
+                This permanently removes the file from disk.
+              </span>
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                className="btn-ghost"
+                onClick={() => setConfirmDeleteFile(null)}
+                disabled={deletingFile}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn-danger"
+                onClick={() => deleteFile(confirmDeleteFile)}
+                disabled={deletingFile}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {playing && (
         <VideoPlayerModal

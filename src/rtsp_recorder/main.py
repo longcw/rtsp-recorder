@@ -261,6 +261,23 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             dropped = 0
         return {"dropped": dropped}
 
+    @app.delete("/api/streams/{name}/files/{filename}", response_model=dict)
+    async def delete_recording(name: str, filename: str) -> dict:
+        if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        # Defence-in-depth: ensure the resolved path stays inside the stream's
+        # own recordings dir before we unlink anything.
+        target = _resolve_stream_dir(name) / filename
+        try:
+            target.resolve().relative_to(recordings_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid path")
+        try:
+            await manager.delete_file(name, filename)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return {"name": filename, "deleted": True}
+
     @app.patch("/api/streams/{name}/files/{filename}", response_model=dict)
     async def patch_file(name: str, filename: str, body: FileIdleUpdate) -> dict:
         if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
