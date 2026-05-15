@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import {
+  Activity,
   AlertTriangle,
   Download,
+  Moon,
   Pause,
   Play,
   PlayCircle,
   RotateCw,
   Trash2,
+  X,
 } from "lucide-react";
 import type { RecordingFile, StreamStatus } from "../types";
 import { api } from "../api";
@@ -67,6 +70,24 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
       toast("error", e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function setIdle(filename: string, idle: boolean) {
+    // Optimistic: update locally so the chip flips immediately.
+    setFiles((cur) =>
+      cur ? cur.map((x) => (x.name === filename ? { ...x, idle } : x)) : cur,
+    );
+    try {
+      await api.setFileIdle(stream.name, filename, idle);
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+      try {
+        const list = await api.listFiles(stream.name);
+        setFiles(list);
+      } catch {
+        /* leave optimistic state */
+      }
     }
   }
 
@@ -183,7 +204,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24">
                     Size
                   </th>
-                  <th className="px-4 py-2.5 w-20" />
+                  <th className="px-4 py-2.5 w-28" />
                 </tr>
               </thead>
               <tbody>
@@ -206,6 +227,36 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                             <span className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
                               <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse-dot" />
                               REC
+                            </span>
+                          )}
+                          {!live && f.idle === true && (
+                            <span
+                              className="inline-flex items-center gap-1 pl-1.5 pr-0.5 h-5 rounded-md bg-indigo-500/10 border border-indigo-400/25 text-indigo-200 text-[10px] font-semibold uppercase tracking-wider shrink-0"
+                              title="No motion detected. Will be pruned on the idle retention schedule. Click X if this is wrong."
+                            >
+                              <Moon size={10} />
+                              Idle
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setIdle(f.name, false);
+                                }}
+                                className="ml-0.5 mr-0.5 inline-flex items-center justify-center h-3.5 w-3.5 rounded hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-100"
+                                aria-label="Mark as not idle"
+                                title="Mark as not idle"
+                              >
+                                <X size={10} />
+                              </button>
+                            </span>
+                          )}
+                          {!live && f.idle === false && (
+                            <span
+                              className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-amber-400/8 border border-amber-400/20 text-amber-200/90 text-[10px] font-semibold uppercase tracking-wider shrink-0"
+                              title="Motion detected. Kept on the regular retention schedule."
+                            >
+                              <Activity size={10} />
+                              Action
                             </span>
                           )}
                           <div className="min-w-0">
@@ -243,6 +294,19 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                       </td>
                       <td className="px-2 py-1.5 text-right">
                         <div className="inline-flex items-center gap-0.5">
+                          {!live && f.idle !== true && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setIdle(f.name, true);
+                              }}
+                              className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-400 hover:text-indigo-200"
+                              title="Mark as idle"
+                            >
+                              <Moon size={14} />
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={(e) => {

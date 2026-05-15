@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import idle_index
 from .config import ConfigStore
 from .manager import RecorderManager
 from .models import (
@@ -41,6 +42,14 @@ class StreamUpdate(BaseModel):
 
 class RetentionUpdate(BaseModel):
     retention_days: int
+
+
+class IdleRetentionUpdate(BaseModel):
+    idle_retention_days: int
+
+
+class FileIdleUpdate(BaseModel):
+    idle: bool
 
 
 class SegmentUpdate(BaseModel):
@@ -164,9 +173,12 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if not target.exists():
             return []
         tz = ZoneInfo(cfg.timezone)
+        idle_data = idle_index.load(target)
         files: list[RecordingFile] = []
         for f in target.iterdir():
             if not f.is_file():
+                continue
+            if f.name == idle_index.INDEX_FILENAME:
                 continue
             try:
                 st = f.stat()
@@ -184,6 +196,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 duration_seconds = max(
                     0.0, (modified_at - start_aware).total_seconds()
                 )
+            entry = idle_data.get(f.name)
+            idle = entry.get("idle") if isinstance(entry, dict) else None
             files.append(
                 RecordingFile(
                     name=f.name,
@@ -191,10 +205,21 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                     modified_at=modified_at,
                     started_at=started_at_naive,
                     duration_seconds=duration_seconds,
+                    idle=idle if isinstance(idle, bool) else None,
                 )
             )
         files.sort(key=lambda r: r.name, reverse=True)
         return files
+
+    @app.patch("/api/streams/{name}/files/{filename}", response_model=dict)
+    async def patch_file(name: str, filename: str, body: FileIdleUpdate) -> dict:
+        if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        try:
+            await manager.set_file_idle(name, filename, body.idle)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return {"name": filename, "idle": body.idle}
 
     @app.get("/api/streams/{name}/files/{filename}")
     async def download_file(name: str, filename: str):
@@ -222,6 +247,15 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 status_code=400, detail="retention_days must be >= 1"
             )
         return await manager.set_retention(body.retention_days)
+
+    @app.put("/api/config/idle-retention", response_model=Config)
+    async def set_idle_retention(body: IdleRetentionUpdate) -> Config:
+        if body.idle_retention_days < 1 or body.idle_retention_days > 3650:
+            raise HTTPException(
+                status_code=400,
+                detail="idle_retention_days must be between 1 and 3650",
+            )
+        return await manager.set_idle_retention(body.idle_retention_days)
 
     @app.put("/api/config/segment-seconds", response_model=Config)
     async def set_segment_seconds(body: SegmentUpdate) -> Config:

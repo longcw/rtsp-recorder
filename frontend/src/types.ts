@@ -25,6 +25,7 @@ export interface StreamStatus {
 export interface ServiceStatus {
   running: boolean;
   retention_days: number;
+  idle_retention_days: number;
   segment_seconds: number;
   timezone: string;
   streams: StreamStatus[];
@@ -40,11 +41,14 @@ export interface RecordingFile {
   started_at: string | null;
   // mtime - started_at, in seconds. Null when started_at is null.
   duration_seconds: number | null;
+  // Backend idle classification. null = not yet analyzed.
+  idle: boolean | null;
 }
 
 export interface Config {
   streams: Stream[];
   retention_days: number;
+  idle_retention_days: number;
   segment_seconds: number;
   timezone: string;
   running: boolean;

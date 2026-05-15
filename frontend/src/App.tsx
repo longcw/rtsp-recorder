@@ -6,6 +6,7 @@ import { Header } from "./components/Header";
 import { StreamList } from "./components/StreamList";
 import { StreamDetail } from "./components/StreamDetail";
 import { AddStreamDialog } from "./components/AddStreamDialog";
+import { IdleRetentionCard } from "./components/IdleRetentionCard";
 import { RetentionCard } from "./components/RetentionCard";
 import { SegmentLengthCard } from "./components/SegmentLengthCard";
 import { TimezoneCard } from "./components/TimezoneCard";
@@ -125,6 +126,11 @@ function Dashboard() {
                 onUpdate={refresh}
               />
               <RetentionCard
+                retentionDays={status.retention_days}
+                onUpdate={refresh}
+              />
+              <IdleRetentionCard
+                idleRetentionDays={status.idle_retention_days}
                 retentionDays={status.retention_days}
                 onUpdate={refresh}
               />

@@ -36,6 +36,11 @@ class Stream(BaseModel):
 class Config(BaseModel):
     streams: list[Stream] = Field(default_factory=list)
     retention_days: int = Field(default=7, ge=1, le=3650)
+    # Shorter retention applied to recordings flagged as "idle" (no detectable
+    # motion). Bounded the same way as retention_days. Must be <= retention_days
+    # at use sites; we accept any valid value here and clamp in the pruner so
+    # the API stays simple.
+    idle_retention_days: int = Field(default=1, ge=1, le=3650)
     # How long each rotating file is, in seconds. Default 5 minutes; bounded to
     # keep ffmpeg's segment muxer healthy and the file count reasonable.
     segment_seconds: int = Field(default=300, ge=10, le=3600)
@@ -71,6 +76,7 @@ class StreamStatus(BaseModel):
 class ServiceStatus(BaseModel):
     running: bool
     retention_days: int
+    idle_retention_days: int
     segment_seconds: int
     timezone: str
     streams: list[StreamStatus]
@@ -89,3 +95,9 @@ class RecordingFile(BaseModel):
     # Approximate length in seconds: mtime - (parsed start, localized to
     # the configured tz). None when started_at could not be parsed.
     duration_seconds: float | None = None
+    # True if background-subtraction analysis classified the whole recording
+    # as idle (no motion). False if motion was detected, or if the user has
+    # explicitly cleared the tag. None when not yet analyzed — usually the
+    # currently-recording segment, or any segment finalized in the last
+    # analysis-loop tick.
+    idle: bool | None = None

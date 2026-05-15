@@ -60,6 +60,23 @@ export const api = {
       body: JSON.stringify({ retention_days }),
     }).then(json<Config>),
 
+  setIdleRetention: (idle_retention_days: number) =>
+    fetch("/api/config/idle-retention", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ idle_retention_days }),
+    }).then(json<Config>),
+
+  setFileIdle: (stream: string, file: string, idle: boolean) =>
+    fetch(
+      `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ idle }),
+      },
+    ).then(json<{ name: string; idle: boolean }>),
+
   setSegmentSeconds: (segment_seconds: number) =>
     fetch("/api/config/segment-seconds", {
       method: "PUT",

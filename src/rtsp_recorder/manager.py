@@ -3,16 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import idle_index
 from .config import ConfigStore
+from .idle_detector import detect_idle
 from .models import Config, Stream, ServiceStatus
 from .recorder import StreamRecorder
 
 logger = logging.getLogger(__name__)
 
 PRUNE_INTERVAL_SECONDS = 60 * 30  # every 30 minutes is plenty
+ANALYZE_INTERVAL_SECONDS = 30
+# A file is considered "still being written" if its mtime advanced this
+# recently. Skip such files in the analyzer to avoid reading a partial moov.
+ANALYZE_MIN_AGE_SECONDS = 15
 
 
 class RecorderManager:
@@ -30,6 +37,8 @@ class RecorderManager:
         self._prune_task: asyncio.Task[None] | None = None
         self._prune_wake = asyncio.Event()
         self._prune_stop = asyncio.Event()
+        self._analyze_task: asyncio.Task[None] | None = None
+        self._analyze_stop = asyncio.Event()
 
     async def start(self) -> None:
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
@@ -38,15 +47,25 @@ class RecorderManager:
             await self.reconcile()
         self._prune_stop.clear()
         self._prune_task = asyncio.create_task(self._prune_loop(), name="pruner")
+        self._analyze_stop.clear()
+        self._analyze_task = asyncio.create_task(
+            self._analyze_loop(), name="analyzer"
+        )
 
     async def shutdown(self) -> None:
         self._prune_stop.set()
         self._prune_wake.set()
+        self._analyze_stop.set()
         if self._prune_task:
             try:
                 await asyncio.wait_for(self._prune_task, timeout=5)
             except asyncio.TimeoutError:
                 self._prune_task.cancel()
+        if self._analyze_task:
+            try:
+                await asyncio.wait_for(self._analyze_task, timeout=5)
+            except asyncio.TimeoutError:
+                self._analyze_task.cancel()
         async with self._lock:
             await asyncio.gather(
                 *(r.stop() for r in self._recorders.values()), return_exceptions=True
@@ -69,6 +88,23 @@ class RecorderManager:
         # Run a prune pass soon to apply the new value.
         self._prune_wake.set()
         return cfg
+
+    async def set_idle_retention(self, days: int) -> Config:
+        cfg = await self.store.get()
+        cfg.idle_retention_days = days
+        cfg = await self.store.update(cfg)
+        self._prune_wake.set()
+        return cfg
+
+    async def set_file_idle(self, stream_name: str, filename: str, idle: bool) -> None:
+        """Manually override a recording's idle flag."""
+        target_dir = self.recordings_dir / stream_name
+        if not (target_dir / filename).is_file():
+            raise KeyError(f"file '{filename}' not found in stream '{stream_name}'")
+        await asyncio.to_thread(idle_index.set_idle, target_dir, filename, idle)
+        # Newly-flagged-idle file may now be due for an earlier prune; wake the
+        # pruner so the change is visible quickly.
+        self._prune_wake.set()
 
     async def set_segment_seconds(self, seconds: int) -> Config:
         cfg = await self.store.get()
@@ -182,6 +218,7 @@ class RecorderManager:
         return ServiceStatus(
             running=cfg.running,
             retention_days=cfg.retention_days,
+            idle_retention_days=cfg.idle_retention_days,
             segment_seconds=cfg.segment_seconds,
             timezone=cfg.timezone,
             streams=statuses,
@@ -193,7 +230,15 @@ class RecorderManager:
         while not self._prune_stop.is_set():
             try:
                 cfg = await self.store.get()
-                deleted = prune_old_files(self.recordings_dir, cfg.retention_days)
+                # Idle retention must not exceed the regular retention — at the
+                # API level we accept any valid value; clamp here so nonsensical
+                # combinations (idle_retention > retention) collapse to "treat
+                # idle the same as normal" rather than keeping idle files
+                # *longer* than busy ones.
+                idle_days = min(cfg.idle_retention_days, cfg.retention_days)
+                deleted = prune_old_files(
+                    self.recordings_dir, cfg.retention_days, idle_days
+                )
                 if deleted:
                     logger.info("pruner: removed %d old files", deleted)
             except Exception:
@@ -206,6 +251,75 @@ class RecorderManager:
                 )
             except asyncio.TimeoutError:
                 pass
+
+    # ---- analyzer loop ----
+
+    async def _analyze_loop(self) -> None:
+        """Scan finalized segments and tag them as idle/not-idle.
+
+        Each tick walks every stream directory, finds .mp4 files that have
+        no entry in the per-stream idle index, and analyzes them one at a
+        time. Skips files whose mtime advanced recently — those are either
+        the live segment or one that just rotated, and we want a settled
+        moov before reading.
+        """
+        # Small initial delay so we don't fight startup work.
+        try:
+            await asyncio.wait_for(self._analyze_stop.wait(), timeout=5)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        while not self._analyze_stop.is_set():
+            try:
+                await self._analyze_pending()
+            except Exception:
+                logger.exception("analyzer: tick failed")
+
+            try:
+                await asyncio.wait_for(
+                    self._analyze_stop.wait(), timeout=ANALYZE_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _analyze_pending(self) -> None:
+        if not self.recordings_dir.exists():
+            return
+        now = time.time()
+        for stream_dir in self.recordings_dir.iterdir():
+            if not stream_dir.is_dir():
+                continue
+            index = await asyncio.to_thread(idle_index.load, stream_dir)
+            for f in sorted(stream_dir.iterdir()):
+                if self._analyze_stop.is_set():
+                    return
+                if not f.is_file() or not f.name.endswith(".mp4"):
+                    continue
+                if f.name in index:
+                    continue
+                try:
+                    st = f.stat()
+                except FileNotFoundError:
+                    continue
+                if now - st.st_mtime < ANALYZE_MIN_AGE_SECONDS:
+                    continue
+                result = await detect_idle(f)
+                if result is None:
+                    # Unanalyzable (decode error, too short). Skip — leave
+                    # absent from the index so we'll retry next tick; if the
+                    # file is genuinely broken we'll burn cycles forever,
+                    # but that's bounded by the file count and prune horizon.
+                    continue
+                await asyncio.to_thread(
+                    idle_index.set_idle, stream_dir, f.name, result
+                )
+                logger.debug(
+                    "analyzer: %s/%s -> idle=%s",
+                    stream_dir.name,
+                    f.name,
+                    result,
+                )
 
 
 def rec_status_for_inactive(stream: Stream, *, running: bool):
@@ -225,22 +339,41 @@ def rec_status_for_inactive(stream: Stream, *, running: bool):
     )
 
 
-def prune_old_files(recordings_dir: Path, retention_days: int) -> int:
-    """Delete files older than `retention_days` (by mtime). Returns count removed."""
+def prune_old_files(
+    recordings_dir: Path,
+    retention_days: int,
+    idle_retention_days: int,
+) -> int:
+    """Delete files older than the applicable retention.
+
+    Files flagged as idle in the per-stream `.idle.json` index use
+    `idle_retention_days`; everything else uses `retention_days`. Returns
+    the number of files removed.
+    """
     if not recordings_dir.exists():
         return 0
-    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    now = datetime.now(timezone.utc)
+    busy_cutoff = now - timedelta(days=retention_days)
+    idle_cutoff = now - timedelta(days=idle_retention_days)
     removed = 0
     for stream_dir in recordings_dir.iterdir():
         if not stream_dir.is_dir():
             continue
+        index = idle_index.load(stream_dir)
+        present: set[str] = set()
         for f in stream_dir.iterdir():
             if not f.is_file():
+                continue
+            # Don't try to prune the index file itself.
+            if f.name == idle_index.INDEX_FILENAME:
                 continue
             try:
                 mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
             except FileNotFoundError:
                 continue
+            entry = index.get(f.name)
+            is_idle = isinstance(entry, dict) and entry.get("idle") is True
+            cutoff = idle_cutoff if is_idle else busy_cutoff
             if mtime < cutoff:
                 try:
                     f.unlink()
@@ -249,4 +382,8 @@ def prune_old_files(recordings_dir: Path, retention_days: int) -> int:
                     pass
                 except OSError as e:
                     logger.warning("pruner: could not remove %s: %s", f, e)
+            else:
+                present.add(f.name)
+        # Drop index entries for files we just removed (or that vanished).
+        idle_index.drop_missing(stream_dir, present)
     return removed
