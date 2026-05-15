@@ -1,8 +1,10 @@
 """FastAPI app + REST API for managing the recorder service."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,10 +13,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import re
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from . import idle_index
 from .config import ConfigStore
@@ -349,6 +352,89 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             media_type="video/mp4",
             filename=filename,
             headers={"Accept-Ranges": "bytes"},
+        )
+
+    @app.get("/api/streams/{name}/files/{filename}/clip")
+    async def clip_file(
+        name: str,
+        filename: str,
+        start: float = Query(..., ge=0.0),
+        end: float = Query(..., gt=0.0),
+    ):
+        if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        if end <= start:
+            raise HTTPException(status_code=400, detail="end must be greater than start")
+        # Cap clip duration. An hour is plenty for any "find the interesting bit"
+        # workflow and stops a fat-fingered drag from spinning ffmpeg on a
+        # multi-hour span.
+        if end - start > 3600:
+            raise HTTPException(
+                status_code=400, detail="clip duration must be <= 1 hour"
+            )
+        target = _resolve_stream_dir(name) / filename
+        try:
+            target.resolve().relative_to(recordings_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid path")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+
+        # Write into a per-clip tempfile and stream it back, then delete via
+        # the background task. We can't pipe ffmpeg straight to the response
+        # because MP4 needs the moov atom, which non-fragmented output writes
+        # at the end after seeking the file.
+        stem = filename.rsplit(".", 1)[0]
+        suffix = f"_clip_{int(round(start))}-{int(round(end))}.mp4"
+        out_fd, out_path_str = tempfile.mkstemp(prefix=f"{stem}", suffix=suffix)
+        os.close(out_fd)
+        out_path = Path(out_path_str)
+
+        args = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-y",
+            "-ss", f"{start:.3f}",
+            "-to", f"{end:.3f}",
+            "-i", str(target),
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            out_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail="ffmpeg not available")
+
+        _, err = await proc.communicate()
+        if proc.returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
+            out_path.unlink(missing_ok=True)
+            tail = err.decode(errors="replace").strip().splitlines()[-1:]
+            detail = tail[0] if tail else "ffmpeg failed"
+            raise HTTPException(status_code=500, detail=f"clip failed: {detail}")
+
+        download_name = f"{stem}{suffix}"
+
+        def _cleanup() -> None:
+            try:
+                out_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("failed to delete clip tempfile %s", out_path)
+
+        return FileResponse(
+            out_path,
+            media_type="video/mp4",
+            filename=download_name,
+            background=BackgroundTask(_cleanup),
         )
 
     # ---- retention / config ----

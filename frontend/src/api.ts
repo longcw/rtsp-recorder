@@ -53,6 +53,35 @@ export const api = {
   fileUrl: (stream: string, file: string) =>
     `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}`,
 
+  clipFile: async (
+    stream: string,
+    file: string,
+    startSeconds: number,
+    endSeconds: number,
+  ): Promise<{ blob: Blob; filename: string }> => {
+    const url =
+      `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}/clip` +
+      `?start=${encodeURIComponent(startSeconds.toFixed(3))}` +
+      `&end=${encodeURIComponent(endSeconds.toFixed(3))}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      let detail = text;
+      try {
+        const body = JSON.parse(text);
+        detail = body?.detail ?? text;
+      } catch {
+        // not JSON
+      }
+      throw new Error(detail || `${res.status} ${res.statusText}`);
+    }
+    const disp = res.headers.get("content-disposition") ?? "";
+    const m = disp.match(/filename="([^"]+)"/);
+    const filename = m?.[1] ?? `${file.replace(/\.[^.]+$/, "")}_clip.mp4`;
+    const blob = await res.blob();
+    return { blob, filename };
+  },
+
   setRetention: (retention_days: number) =>
     fetch("/api/config/retention", {
       method: "PUT",
