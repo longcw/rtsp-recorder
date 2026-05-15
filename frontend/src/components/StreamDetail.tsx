@@ -208,11 +208,19 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                             <div className="text-ink-100 tabular-nums truncate">
                               {range.primary}
                             </div>
-                            <div
-                              className="font-mono text-[11px] text-ink-400 truncate"
-                              title={f.name}
-                            >
-                              {range.secondary ?? f.name}
+                            <div className="text-[11px] text-ink-400 truncate flex items-center gap-1.5">
+                              {range.dateLabel && (
+                                <>
+                                  <span>{range.dateLabel}</span>
+                                  <span className="text-ink-500">·</span>
+                                </>
+                              )}
+                              <span
+                                className="font-mono text-ink-500 truncate"
+                                title={f.name}
+                              >
+                                {f.name}
+                              </span>
                             </div>
                           </div>
                         </div>
@@ -369,13 +377,14 @@ function addSecondsToHms(time: string, seconds: number): string {
 function formatTimeRange(
   f: { name: string; started_at: string | null; duration_seconds: number | null },
   live: boolean,
-): { primary: string; secondary: string | null } {
+): { primary: string; dateLabel: string | null } {
   if (!f.started_at) {
-    // Filename didn't match our pattern — show it directly.
-    return { primary: f.name, secondary: null };
+    // Filename didn't match our pattern — fall back to showing it as the
+    // primary and let the filename sub-row repeat it (cheap, harmless).
+    return { primary: f.name, dateLabel: null };
   }
   const parsed = parseNaiveIso(f.started_at);
-  if (!parsed) return { primary: f.name, secondary: null };
+  if (!parsed) return { primary: f.name, dateLabel: null };
 
   const dur = f.duration_seconds ?? 0;
   const endTime = live ? null : addSecondsToHms(parsed.time, dur);
@@ -383,14 +392,15 @@ function formatTimeRange(
     ? `${parsed.time} → ${endTime}`
     : `${parsed.time} → …`;
 
-  // Date as secondary, in a human-friendly relative form when recent.
+  // Friendly date for the sub-row. Falls back to the ISO date for older
+  // recordings so users can always tell which day a file came from.
   const today = isoDateToday();
   const yesterday = isoDateOffset(-1);
-  let dateLabel = parsed.date;
+  let dateLabel: string = parsed.date;
   if (parsed.date === today) dateLabel = "Today";
   else if (parsed.date === yesterday) dateLabel = "Yesterday";
 
-  return { primary, secondary: dateLabel };
+  return { primary, dateLabel };
 }
 
 function isoDateToday(): string {
