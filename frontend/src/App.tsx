@@ -7,6 +7,7 @@ import { StreamList } from "./components/StreamList";
 import { StreamDetail } from "./components/StreamDetail";
 import { AddStreamDialog } from "./components/AddStreamDialog";
 import { IdleRetentionCard } from "./components/IdleRetentionCard";
+import { MotionThresholdCard } from "./components/MotionThresholdCard";
 import { RetentionCard } from "./components/RetentionCard";
 import { SegmentLengthCard } from "./components/SegmentLengthCard";
 import { TimezoneCard } from "./components/TimezoneCard";
@@ -105,7 +106,7 @@ function Dashboard() {
         </div>
       )}
 
-      <main className="flex-1 min-h-0 grid grid-cols-[320px_1fr]">
+      <main className="flex-1 min-h-0 grid grid-cols-[240px_1fr] md:grid-cols-[280px_1fr] xl:grid-cols-[320px_1fr]">
         <aside className="border-r border-white/[0.06] flex flex-col min-h-0">
           <div className="flex-1 min-h-0">
             <StreamList
@@ -132,6 +133,10 @@ function Dashboard() {
               <IdleRetentionCard
                 idleRetentionDays={status.idle_retention_days}
                 retentionDays={status.retention_days}
+                onUpdate={refresh}
+              />
+              <MotionThresholdCard
+                motionThreshold={status.motion_threshold}
                 onUpdate={refresh}
               />
             </>

@@ -8,6 +8,7 @@ import {
   Play,
   PlayCircle,
   RotateCw,
+  ScanSearch,
   Trash2,
   X,
 } from "lucide-react";
@@ -73,6 +74,43 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
     }
   }
 
+  async function rescanFile(filename: string) {
+    // Optimistic: clear the chip so the user sees something happen
+    // immediately. Polling will refill with the new label.
+    setFiles((cur) =>
+      cur ? cur.map((x) => (x.name === filename ? { ...x, idle: null } : x)) : cur,
+    );
+    try {
+      await api.reanalyzeFile(stream.name, filename);
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+      try {
+        const list = await api.listFiles(stream.name);
+        setFiles(list);
+      } catch {
+        /* leave optimistic state */
+      }
+    }
+  }
+
+  async function rescanIdle() {
+    // Optimistically clear all idle flags so chips disappear immediately;
+    // the analyzer will re-populate them within a few seconds.
+    setFiles((cur) => (cur ? cur.map((x) => ({ ...x, idle: null })) : cur));
+    try {
+      const res = await api.reanalyzeIdle(stream.name);
+      toast("success", `Re-scanning ${res.dropped} recording(s) for idle…`);
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+      try {
+        const list = await api.listFiles(stream.name);
+        setFiles(list);
+      } catch {
+        /* leave optimistic state */
+      }
+    }
+  }
+
   async function setIdle(filename: string, idle: boolean) {
     // Optimistic: update locally so the chip flips immediately.
     setFiles((cur) =>
@@ -107,7 +145,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="px-6 py-5 border-b border-white/[0.06]">
+      <div className="px-4 sm:px-6 py-5 border-b border-white/[0.06]">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
             <div className="flex items-center gap-2.5">
@@ -129,7 +167,9 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
               title={stream.enabled ? "Disable" : "Enable"}
             >
               {stream.enabled ? <Pause size={15} /> : <Play size={15} />}
-              {stream.enabled ? "Disable" : "Enable"}
+              <span className="hidden sm:inline">
+                {stream.enabled ? "Disable" : "Enable"}
+              </span>
             </button>
             <button
               className="btn-danger"
@@ -137,7 +177,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
               disabled={busy}
             >
               <Trash2 size={15} />
-              Remove
+              <span className="hidden sm:inline">Remove</span>
             </button>
           </div>
         </div>
@@ -165,23 +205,33 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
         )}
       </div>
 
-      <div className="flex-1 min-h-0 px-6 py-5 flex flex-col">
+      <div className="flex-1 min-h-0 px-4 sm:px-6 py-5 flex flex-col">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-ink-200">Recordings</h2>
-          <button
-            className="btn-ghost h-7 px-2 text-xs"
-            onClick={() => {
-              setLoadingFiles(true);
-              api
-                .listFiles(stream.name)
-                .then(setFiles)
-                .catch((e) => toast("error", String(e)))
-                .finally(() => setLoadingFiles(false));
-            }}
-          >
-            <RotateCw size={13} />
-            Refresh
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              className="btn-ghost h-7 px-2 text-xs"
+              onClick={rescanIdle}
+              title="Drop idle labels and re-run the detector on every recording in this stream"
+            >
+              <ScanSearch size={13} />
+              Re-scan idle
+            </button>
+            <button
+              className="btn-ghost h-7 px-2 text-xs"
+              onClick={() => {
+                setLoadingFiles(true);
+                api
+                  .listFiles(stream.name)
+                  .then(setFiles)
+                  .catch((e) => toast("error", String(e)))
+                  .finally(() => setLoadingFiles(false));
+              }}
+            >
+              <RotateCw size={13} />
+              Refresh
+            </button>
+          </div>
         </div>
         <div className="card flex-1 min-h-0 overflow-y-auto">
           {loadingFiles && files === null ? (
@@ -201,10 +251,10 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24">
                     Duration
                   </th>
-                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24">
+                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24 hidden sm:table-cell">
                     Size
                   </th>
-                  <th className="px-4 py-2.5 w-28" />
+                  <th className="px-2 py-2.5 w-36" />
                 </tr>
               </thead>
               <tbody>
@@ -289,11 +339,24 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                           formatDuration(f.duration_seconds)
                         )}
                       </td>
-                      <td className="px-4 py-2.5 text-ink-300 tabular-nums">
+                      <td className="px-4 py-2.5 text-ink-300 tabular-nums hidden sm:table-cell">
                         {formatBytes(f.size)}
                       </td>
                       <td className="px-2 py-1.5 text-right">
                         <div className="inline-flex items-center gap-0.5">
+                          {!live && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                rescanFile(f.name);
+                              }}
+                              className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-400 hover:text-ink-100"
+                              title="Re-scan this recording for motion"
+                            >
+                              <RotateCw size={13} />
+                            </button>
+                          )}
                           {!live && f.idle !== true && (
                             <button
                               type="button"

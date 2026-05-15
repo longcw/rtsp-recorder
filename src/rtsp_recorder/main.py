@@ -48,6 +48,10 @@ class IdleRetentionUpdate(BaseModel):
     idle_retention_days: int
 
 
+class MotionThresholdUpdate(BaseModel):
+    motion_threshold: float
+
+
 class FileIdleUpdate(BaseModel):
     idle: bool
 
@@ -198,6 +202,13 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 )
             entry = idle_data.get(f.name)
             idle = entry.get("idle") if isinstance(entry, dict) else None
+            # Prefer ffprobe-derived duration when we have one. The
+            # mtime-minus-filename fallback is noisy because segment
+            # cuts only happen on keyframes — actual video can run
+            # seconds past the nominal boundary.
+            cached_duration = entry.get("duration") if isinstance(entry, dict) else None
+            if isinstance(cached_duration, (int, float)) and cached_duration >= 0:
+                duration_seconds = float(cached_duration)
             files.append(
                 RecordingFile(
                     name=f.name,
@@ -210,6 +221,29 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             )
         files.sort(key=lambda r: r.name, reverse=True)
         return files
+
+    @app.post("/api/streams/{name}/files/{filename}/reanalyze", response_model=dict)
+    async def reanalyze_file(name: str, filename: str) -> dict:
+        if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        try:
+            await manager.reanalyze_file(name, filename)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return {"name": filename}
+
+    @app.post("/api/streams/{name}/reanalyze-idle", response_model=dict)
+    async def reanalyze_idle(name: str) -> dict:
+        cfg = await store.get()
+        if not any(s.name == name for s in cfg.streams):
+            raise HTTPException(status_code=404, detail="stream not found")
+        try:
+            dropped = await manager.reanalyze_stream(name)
+        except KeyError:
+            # No recordings dir yet — nothing to drop, but answer success
+            # so the UI doesn't show a scary error in the empty-state case.
+            dropped = 0
+        return {"dropped": dropped}
 
     @app.patch("/api/streams/{name}/files/{filename}", response_model=dict)
     async def patch_file(name: str, filename: str, body: FileIdleUpdate) -> dict:
@@ -256,6 +290,15 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 detail="idle_retention_days must be between 1 and 3650",
             )
         return await manager.set_idle_retention(body.idle_retention_days)
+
+    @app.put("/api/config/motion-threshold", response_model=Config)
+    async def set_motion_threshold(body: MotionThresholdUpdate) -> Config:
+        if not (0.5 <= body.motion_threshold <= 50.0):
+            raise HTTPException(
+                status_code=400,
+                detail="motion_threshold must be between 0.5 and 50",
+            )
+        return await manager.set_motion_threshold(body.motion_threshold)
 
     @app.put("/api/config/segment-seconds", response_model=Config)
     async def set_segment_seconds(body: SegmentUpdate) -> Config:

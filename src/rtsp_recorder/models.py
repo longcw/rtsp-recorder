@@ -41,6 +41,12 @@ class Config(BaseModel):
     # at use sites; we accept any valid value here and clamp in the pruner so
     # the API stays simple.
     idle_retention_days: int = Field(default=1, ge=1, le=3650)
+    # Motion-detector threshold. The 95th-percentile consecutive-frame mean
+    # absolute difference must stay below this for a recording to be classified
+    # as idle. Lower = more sensitive to motion (fewer idle); higher = more
+    # permissive (more idle). Calibrated for 8-bit grayscale 64x36
+    # thumbnails — typical sensor noise sits 0.5–2, real walking motion 6+.
+    motion_threshold: float = Field(default=5.0, ge=0.5, le=50.0)
     # How long each rotating file is, in seconds. Default 5 minutes; bounded to
     # keep ffmpeg's segment muxer healthy and the file count reasonable.
     segment_seconds: int = Field(default=300, ge=10, le=3600)
@@ -77,6 +83,7 @@ class ServiceStatus(BaseModel):
     running: bool
     retention_days: int
     idle_retention_days: int
+    motion_threshold: float
     segment_seconds: int
     timezone: str
     streams: list[StreamStatus]

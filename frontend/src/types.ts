@@ -26,6 +26,7 @@ export interface ServiceStatus {
   running: boolean;
   retention_days: number;
   idle_retention_days: number;
+  motion_threshold: number;
   segment_seconds: number;
   timezone: string;
   streams: StreamStatus[];
@@ -49,6 +50,7 @@ export interface Config {
   streams: Stream[];
   retention_days: number;
   idle_retention_days: number;
+  motion_threshold: number;
   segment_seconds: number;
   timezone: string;
   running: boolean;

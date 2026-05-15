@@ -67,6 +67,13 @@ export const api = {
       body: JSON.stringify({ idle_retention_days }),
     }).then(json<Config>),
 
+  setMotionThreshold: (motion_threshold: number) =>
+    fetch("/api/config/motion-threshold", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ motion_threshold }),
+    }).then(json<Config>),
+
   setFileIdle: (stream: string, file: string, idle: boolean) =>
     fetch(
       `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}`,
@@ -76,6 +83,17 @@ export const api = {
         body: JSON.stringify({ idle }),
       },
     ).then(json<{ name: string; idle: boolean }>),
+
+  reanalyzeIdle: (stream: string) =>
+    fetch(`/api/streams/${encodeURIComponent(stream)}/reanalyze-idle`, {
+      method: "POST",
+    }).then(json<{ dropped: number }>),
+
+  reanalyzeFile: (stream: string, file: string) =>
+    fetch(
+      `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}/reanalyze`,
+      { method: "POST" },
+    ).then(json<{ name: string }>),
 
   setSegmentSeconds: (segment_seconds: number) =>
     fetch("/api/config/segment-seconds", {

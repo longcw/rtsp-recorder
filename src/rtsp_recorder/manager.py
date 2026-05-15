@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import idle_index
 from .config import ConfigStore
-from .idle_detector import detect_idle
+from .idle_detector import analyze
 from .models import Config, Stream, ServiceStatus
 from .recorder import StreamRecorder
 
@@ -39,6 +39,7 @@ class RecorderManager:
         self._prune_stop = asyncio.Event()
         self._analyze_task: asyncio.Task[None] | None = None
         self._analyze_stop = asyncio.Event()
+        self._analyze_wake = asyncio.Event()
 
     async def start(self) -> None:
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +57,7 @@ class RecorderManager:
         self._prune_stop.set()
         self._prune_wake.set()
         self._analyze_stop.set()
+        self._analyze_wake.set()
         if self._prune_task:
             try:
                 await asyncio.wait_for(self._prune_task, timeout=5)
@@ -96,6 +98,15 @@ class RecorderManager:
         self._prune_wake.set()
         return cfg
 
+    async def set_motion_threshold(self, value: float) -> Config:
+        cfg = await self.store.get()
+        cfg.motion_threshold = value
+        cfg = await self.store.update(cfg)
+        # Threshold change only affects future analyses; existing labels
+        # stick until the user explicitly rescans. Don't auto-wipe — the
+        # rescan endpoint exists for that.
+        return cfg
+
     async def set_file_idle(self, stream_name: str, filename: str, idle: bool) -> None:
         """Manually override a recording's idle flag."""
         target_dir = self.recordings_dir / stream_name
@@ -105,6 +116,47 @@ class RecorderManager:
         # Newly-flagged-idle file may now be due for an earlier prune; wake the
         # pruner so the change is visible quickly.
         self._prune_wake.set()
+
+    async def reanalyze_file(self, stream_name: str, filename: str) -> None:
+        """Drop one file's entry from its stream's idle index. The analyzer
+        will pick it up on its next wake.
+        """
+        target_dir = self.recordings_dir / stream_name
+        if not (target_dir / filename).is_file():
+            raise KeyError(f"file '{filename}' not found in stream '{stream_name}'")
+
+        def _drop() -> None:
+            data = idle_index.load(target_dir)
+            if data.pop(filename, None) is not None:
+                idle_index.save(target_dir, data)
+
+        await asyncio.to_thread(_drop)
+        self._analyze_wake.set()
+
+    async def reanalyze_stream(self, stream_name: str) -> int:
+        """Drop the idle index for one stream so the analyzer re-labels
+        every file on its next tick. Returns the number of entries dropped.
+
+        This intentionally discards manual overrides too — there is no way
+        to distinguish them, and tuning the detector is the main reason to
+        re-run, so we'd rather give a clean re-scan than silently keep
+        stale "the user said this is idle" flags.
+        """
+        target_dir = self.recordings_dir / stream_name
+        if not target_dir.is_dir():
+            raise KeyError(f"stream '{stream_name}' has no recordings dir")
+
+        def _wipe() -> int:
+            data = idle_index.load(target_dir)
+            n = len(data)
+            idle_index.save(target_dir, {})
+            return n
+
+        n = await asyncio.to_thread(_wipe)
+        # Kick the analyzer so the user sees chips populate within seconds
+        # instead of waiting up to the full interval.
+        self._analyze_wake.set()
+        return n
 
     async def set_segment_seconds(self, seconds: int) -> Config:
         cfg = await self.store.get()
@@ -219,6 +271,7 @@ class RecorderManager:
             running=cfg.running,
             retention_days=cfg.retention_days,
             idle_retention_days=cfg.idle_retention_days,
+            motion_threshold=cfg.motion_threshold,
             segment_seconds=cfg.segment_seconds,
             timezone=cfg.timezone,
             streams=statuses,
@@ -276,16 +329,31 @@ class RecorderManager:
             except Exception:
                 logger.exception("analyzer: tick failed")
 
+            self._analyze_wake.clear()
+            # Wake early on a rescan request, otherwise tick on the regular
+            # cadence. Either way, stop wins.
+            stop_task = asyncio.create_task(self._analyze_stop.wait())
+            wake_task = asyncio.create_task(self._analyze_wake.wait())
             try:
-                await asyncio.wait_for(
-                    self._analyze_stop.wait(), timeout=ANALYZE_INTERVAL_SECONDS
+                done, _ = await asyncio.wait(
+                    {stop_task, wake_task},
+                    timeout=ANALYZE_INTERVAL_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            except asyncio.TimeoutError:
-                pass
+            finally:
+                for t in (stop_task, wake_task):
+                    if not t.done():
+                        t.cancel()
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
     async def _analyze_pending(self) -> None:
         if not self.recordings_dir.exists():
             return
+        cfg = await self.store.get()
+        motion_threshold = cfg.motion_threshold
         now = time.time()
         for stream_dir in self.recordings_dir.iterdir():
             if not stream_dir.is_dir():
@@ -296,7 +364,10 @@ class RecorderManager:
                     return
                 if not f.is_file() or not f.name.endswith(".mp4"):
                     continue
-                if f.name in index:
+                # Re-probe entries that pre-date duration storage so users
+                # don't have to rescan just to get accurate durations.
+                existing = index.get(f.name)
+                if isinstance(existing, dict) and "duration" in existing:
                     continue
                 try:
                     st = f.stat()
@@ -304,21 +375,32 @@ class RecorderManager:
                     continue
                 if now - st.st_mtime < ANALYZE_MIN_AGE_SECONDS:
                     continue
-                result = await detect_idle(f)
-                if result is None:
-                    # Unanalyzable (decode error, too short). Skip — leave
-                    # absent from the index so we'll retry next tick; if the
-                    # file is genuinely broken we'll burn cycles forever,
-                    # but that's bounded by the file count and prune horizon.
+                result = await analyze(f, motion_threshold=motion_threshold)
+                if result.idle is None and result.duration_seconds is None:
+                    # Nothing usable came back (decode + probe both failed).
+                    # Leave absent so we retry next tick.
                     continue
+                # If we already had an idle from a previous run and the new
+                # analysis couldn't reproduce it (e.g. ffmpeg decode flaked
+                # but ffprobe got the duration), keep the older idle.
+                preserved_idle = result.idle
+                if preserved_idle is None and isinstance(existing, dict):
+                    prev = existing.get("idle")
+                    if isinstance(prev, bool):
+                        preserved_idle = prev
                 await asyncio.to_thread(
-                    idle_index.set_idle, stream_dir, f.name, result
+                    idle_index.set_analysis,
+                    stream_dir,
+                    f.name,
+                    idle=preserved_idle,
+                    duration_seconds=result.duration_seconds,
                 )
                 logger.debug(
-                    "analyzer: %s/%s -> idle=%s",
+                    "analyzer: %s/%s -> idle=%s duration=%s",
                     stream_dir.name,
                     f.name,
-                    result,
+                    preserved_idle,
+                    result.duration_seconds,
                 )
 
 
