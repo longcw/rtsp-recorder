@@ -324,12 +324,26 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             end = min(end, file_size - 1)
             length = end - start + 1
 
+            # Open up-front so an FD-exhaustion error surfaces as a clean 503
+            # before any response headers are sent — otherwise the OSError
+            # gets raised mid-stream and Starlette's exception group propagates
+            # an unhandled traceback through the ASGI stack.
+            try:
+                f = open(target, "rb")
+            except OSError as e:
+                logger.warning("open failed for %s: %s", target, e)
+                raise HTTPException(status_code=503, detail="server busy") from e
+            try:
+                f.seek(start)
+            except OSError:
+                f.close()
+                raise
+
             def iter_range():
-                # Re-open + seek for each request; OS page cache handles
-                # the hot-path. Chunking caps memory and lets uvicorn flush
-                # progressively while the client buffers ahead.
-                with open(target, "rb") as f:
-                    f.seek(start)
+                # OS page cache handles the hot path. Chunking caps memory
+                # and lets uvicorn flush progressively while the client
+                # buffers ahead.
+                try:
                     remaining = length
                     while remaining > 0:
                         data = f.read(min(_RANGE_CHUNK, remaining))
@@ -337,6 +351,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                             break
                         remaining -= len(data)
                         yield data
+                finally:
+                    f.close()
 
             return StreamingResponse(
                 iter_range(),
@@ -353,12 +369,16 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 },
             )
 
-        return FileResponse(
-            target,
-            media_type="video/mp4",
-            filename=filename,
-            headers={"Accept-Ranges": "bytes"},
-        )
+        try:
+            return FileResponse(
+                target,
+                media_type="video/mp4",
+                filename=filename,
+                headers={"Accept-Ranges": "bytes"},
+            )
+        except OSError as e:
+            logger.warning("open failed for %s: %s", target, e)
+            raise HTTPException(status_code=503, detail="server busy") from e
 
     @app.get("/api/streams/{name}/files/{filename}/clip")
     async def clip_file(
