@@ -80,3 +80,12 @@ class RecordingFile(BaseModel):
     name: str
     size: int
     modified_at: datetime
+    # Wall-clock time when this segment began, parsed from the filename
+    # (which ffmpeg generates with strftime in the configured timezone).
+    # Naive on purpose: the filename carries no zone, and we want the UI
+    # to display it as-is rather than convert it to the browser's locale.
+    # None if the filename doesn't match the YYYY-MM-DD_HH-MM-SS pattern.
+    started_at: datetime | None = None
+    # Approximate length in seconds: mtime - (parsed start, localized to
+    # the configured tz). None when started_at could not be parsed.
+    duration_seconds: float | None = None

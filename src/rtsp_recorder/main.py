@@ -51,6 +51,26 @@ class TimezoneUpdate(BaseModel):
     timezone: str
 
 
+# ---- helpers ----
+
+_SEGMENT_NAME_FMT = "%Y-%m-%d_%H-%M-%S"
+
+
+def _parse_segment_filename(name: str) -> datetime | None:
+    """Parse a `YYYY-MM-DD_HH-MM-SS.<ext>` segment filename to a naive datetime.
+
+    Returns None if the filename doesn't match — e.g. user-placed files. The
+    result is naive on purpose: the filename carries no timezone, and we
+    treat it as wall-clock in whatever zone the recorder was configured for
+    when ffmpeg wrote it.
+    """
+    stem = name.rsplit(".", 1)[0]
+    try:
+        return datetime.strptime(stem, _SEGMENT_NAME_FMT)
+    except ValueError:
+        return None
+
+
 # ---- app factory ----
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
@@ -143,6 +163,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         target = _resolve_stream_dir(name)
         if not target.exists():
             return []
+        tz = ZoneInfo(cfg.timezone)
         files: list[RecordingFile] = []
         for f in target.iterdir():
             if not f.is_file():
@@ -151,11 +172,25 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 st = f.stat()
             except FileNotFoundError:
                 continue
+            modified_at = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+            started_at_naive = _parse_segment_filename(f.name)
+            duration_seconds: float | None = None
+            if started_at_naive is not None:
+                # Localize the parsed wall-clock time using the configured tz,
+                # then take the delta against mtime (which is in UTC). Both
+                # sides are tz-aware after localization so subtraction is
+                # well-defined.
+                start_aware = started_at_naive.replace(tzinfo=tz)
+                duration_seconds = max(
+                    0.0, (modified_at - start_aware).total_seconds()
+                )
             files.append(
                 RecordingFile(
                     name=f.name,
                     size=st.st_size,
-                    modified_at=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc),
+                    modified_at=modified_at,
+                    started_at=started_at_naive,
+                    duration_seconds=duration_seconds,
                 )
             )
         files.sort(key=lambda r: r.name, reverse=True)

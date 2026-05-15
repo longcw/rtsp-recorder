@@ -172,13 +172,13 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
               <thead className="sticky top-0 bg-ink-900/95 backdrop-blur border-b border-white/[0.06]">
                 <tr className="text-left">
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider">
-                    File
+                    Recording
                   </th>
-                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-32">
+                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24">
+                    Duration
+                  </th>
+                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24">
                     Size
-                  </th>
-                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-40">
-                    Recorded
                   </th>
                   <th className="px-4 py-2.5 w-12" />
                 </tr>
@@ -186,6 +186,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
               <tbody>
                 {(files ?? []).map((f) => {
                   const live = f.name === stream.current_file;
+                  const range = formatTimeRange(f, live);
                   return (
                     <tr
                       key={f.name}
@@ -196,23 +197,37 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                       }`}
                     >
                       <td className="px-4 py-2.5 max-w-0">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
                           {live && (
                             <span className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
                               <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse-dot" />
                               REC
                             </span>
                           )}
-                          <span className="font-mono text-xs text-ink-100 truncate">
-                            {f.name}
-                          </span>
+                          <div className="min-w-0">
+                            <div className="text-ink-100 tabular-nums truncate">
+                              {range.primary}
+                            </div>
+                            <div
+                              className="font-mono text-[11px] text-ink-400 truncate"
+                              title={f.name}
+                            >
+                              {range.secondary ?? f.name}
+                            </div>
+                          </div>
                         </div>
                       </td>
                       <td className="px-4 py-2.5 text-ink-300 tabular-nums">
-                        {formatBytes(f.size)}
+                        {live ? (
+                          <span className="text-emerald-300">
+                            {formatDuration(f.duration_seconds)}
+                          </span>
+                        ) : (
+                          formatDuration(f.duration_seconds)
+                        )}
                       </td>
-                      <td className="px-4 py-2.5 text-ink-400 text-xs">
-                        {live ? "recording…" : timeAgo(f.modified_at)}
+                      <td className="px-4 py-2.5 text-ink-300 tabular-nums">
+                        {formatBytes(f.size)}
                       </td>
                       <td className="px-2 py-1.5 text-right">
                         <a
@@ -315,4 +330,75 @@ function timeAgo(iso: string): string {
   if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24);
   return `${d}d ago`;
+}
+
+function formatDuration(seconds: number | null | undefined): string {
+  if (seconds == null) return "—";
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return rs === 0 ? `${m}m` : `${m}m ${rs}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm === 0 ? `${h}h` : `${h}h ${rm}m`;
+}
+
+// `started_at` is a naive ISO string ("YYYY-MM-DDTHH:MM:SS", no offset)
+// representing wall-clock time in the recorder's configured timezone. We
+// parse the components directly so the browser's local-time interpretation
+// of new Date(naive_iso) doesn't shift them.
+function parseNaiveIso(iso: string): { date: string; time: string } | null {
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return null;
+  return {
+    date: `${m[1]}-${m[2]}-${m[3]}`,
+    time: `${m[4]}:${m[5]}:${m[6]}`,
+  };
+}
+
+function addSecondsToHms(time: string, seconds: number): string {
+  const [hh, mm, ss] = time.split(":").map(Number);
+  const total = (hh * 3600 + mm * 60 + ss + Math.round(seconds)) % 86400;
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function formatTimeRange(
+  f: { name: string; started_at: string | null; duration_seconds: number | null },
+  live: boolean,
+): { primary: string; secondary: string | null } {
+  if (!f.started_at) {
+    // Filename didn't match our pattern — show it directly.
+    return { primary: f.name, secondary: null };
+  }
+  const parsed = parseNaiveIso(f.started_at);
+  if (!parsed) return { primary: f.name, secondary: null };
+
+  const dur = f.duration_seconds ?? 0;
+  const endTime = live ? null : addSecondsToHms(parsed.time, dur);
+  const primary = endTime
+    ? `${parsed.time} → ${endTime}`
+    : `${parsed.time} → …`;
+
+  // Date as secondary, in a human-friendly relative form when recent.
+  const today = isoDateToday();
+  const yesterday = isoDateOffset(-1);
+  let dateLabel = parsed.date;
+  if (parsed.date === today) dateLabel = "Today";
+  else if (parsed.date === yesterday) dateLabel = "Yesterday";
+
+  return { primary, secondary: dateLabel };
+}
+
+function isoDateToday(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function isoDateOffset(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }

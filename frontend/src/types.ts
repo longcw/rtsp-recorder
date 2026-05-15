@@ -34,6 +34,12 @@ export interface RecordingFile {
   name: string;
   size: number;
   modified_at: string;
+  // ISO datetime parsed from the filename (no offset suffix — wall-clock
+  // in the recorder's configured timezone). Null if the filename didn't
+  // match the segment pattern.
+  started_at: string | null;
+  // mtime - started_at, in seconds. Null when started_at is null.
+  duration_seconds: number | null;
 }
 
 export interface Config {
