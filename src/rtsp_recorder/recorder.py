@@ -24,6 +24,25 @@ logger = logging.getLogger(__name__)
 # stream just keeps logging restart attempts, which is fine.
 RESTART_BACKOFF_SECONDS = 5.0
 
+# Socket I/O timeout (microseconds) handed to ffmpeg's RTSP demuxer via
+# `-timeout`. Without it the option defaults to 0 (infinite): when the network
+# drops, ffmpeg blocks forever in a socket read on the dead TCP connection,
+# never writes another segment, and never exits — so our `await proc.wait()`
+# parks indefinitely and the stream never recovers. With a finite timeout
+# ffmpeg errors out and exits on its own, letting the restart loop reconnect.
+# 10s is comfortably below WATCHDOG_HANG_SECONDS so ffmpeg self-heals before
+# the watchdog ever has to step in (and it also covers the connect/handshake
+# phase, where no segment file exists yet for the watchdog to stat).
+FFMPEG_SOCKET_TIMEOUT_US = 10_000_000
+
+# After asking ffmpeg to exit (SIGTERM) we wait this long before escalating to
+# SIGKILL. A network-hung ffmpeg blocked on a dead socket does not honour
+# SIGTERM promptly — its handler only sets a flag the main loop polls between
+# operations, which it never reaches while stuck in recv(). Without escalation
+# the process would not die until the kernel's TCP retransmission timeout
+# (minutes), wedging every restart path that goes through it.
+KILL_GRACE_SECONDS = 5.0
+
 # Watchdog parameters.
 #
 # WATCHDOG_INTERVAL — how often we poll. Small enough to catch a hang quickly,
@@ -87,23 +106,17 @@ class StreamRecorder:
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._proc and self._proc.returncode is None:
-            try:
-                self._proc.terminate()
-            except ProcessLookupError:
-                pass
+        # Force the current ffmpeg down (SIGTERM, escalating to SIGKILL). With
+        # _stop set, _run sees the process exit and breaks out of its restart
+        # loop instead of reconnecting.
+        await self._kill_proc()
         if self._task:
             try:
                 await asyncio.wait_for(self._task, timeout=10)
             except asyncio.TimeoutError:
-                if self._proc and self._proc.returncode is None:
-                    self._proc.kill()
-                try:
-                    await asyncio.wait_for(self._task, timeout=5)
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "recorder %s: task did not exit after kill", self.stream.name
-                    )
+                logger.error(
+                    "recorder %s: task did not exit after kill", self.stream.name
+                )
         self._state = "stopped"
         self._started_at = None
         self._current_file = None
@@ -267,7 +280,7 @@ class StreamRecorder:
                     self._current_file,
                     mtime_age,
                 )
-                self._terminate_proc()
+                await self._kill_proc()
                 return
 
             # --- Check 2: missed wall-clock rotation. ---
@@ -292,15 +305,46 @@ class StreamRecorder:
                             time.localtime(self._last_rotation_wall),
                         ),
                     )
-                    self._terminate_proc()
+                    await self._kill_proc()
                     return
 
-    def _terminate_proc(self) -> None:
-        if self._proc and self._proc.returncode is None:
-            try:
-                self._proc.terminate()
-            except ProcessLookupError:
-                pass
+    async def _kill_proc(self, grace: float = KILL_GRACE_SECONDS) -> None:
+        """Stop ffmpeg, escalating SIGTERM -> SIGKILL if it doesn't exit.
+
+        SIGTERM alone is unreliable for a network-hung ffmpeg (see
+        ``KILL_GRACE_SECONDS``): it may sit blocked in a socket read on a dead
+        connection and never process the signal, so ``proc.wait()`` would never
+        return and the restart loop would stay wedged. We give it ``grace``
+        seconds to exit cleanly, then SIGKILL, which the kernel delivers
+        unconditionally. Both the watchdog and ``stop()`` route through here so
+        there is a single, guaranteed-to-terminate path.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace)
+            return
+        except asyncio.TimeoutError:
+            logger.warning(
+                "recorder %s: ffmpeg ignored SIGTERM for %.0fs; sending SIGKILL",
+                self.stream.name,
+                grace,
+            )
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        # Reap the killed process so it doesn't linger as a zombie and so
+        # callers awaiting proc.wait() elsewhere unblock promptly.
+        try:
+            await proc.wait()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def _ffmpeg_args(self, pattern: str) -> list[str]:
         return [
@@ -315,6 +359,12 @@ class StreamRecorder:
             "-nostdin",
             "-rtsp_transport",
             "tcp",
+            # Socket I/O timeout: bail out of a blocking read/write on a dead
+            # connection instead of hanging forever. This is what lets a
+            # dropped network recover on its own — ffmpeg exits non-zero, the
+            # _run loop reconnects. (Must precede -i; it's an input option.)
+            "-timeout",
+            str(FFMPEG_SOCKET_TIMEOUT_US),
             "-i",
             self.stream.url,
             "-c",
