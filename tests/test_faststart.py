@@ -23,6 +23,19 @@ from rtsp_recorder import faststart
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
 
+def _has_encoder(name: str) -> bool:
+    if not _HAS_FFMPEG:
+        return False
+    out = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        capture_output=True, text=True,
+    ).stdout
+    return name in out
+
+
+_HAS_X265 = _has_encoder("libx265")
+
+
 def _box(box_type: bytes, payload: bytes = b"") -> bytes:
     return struct.pack(">I", 8 + len(payload)) + box_type + payload
 
@@ -84,6 +97,31 @@ class EnsureFaststartTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await faststart.ensure_faststart(p))
         # No temp file left behind.
         self.assertFalse((p.parent / (p.name + ".faststart.tmp")).exists())
+
+    @unittest.skipUnless(_HAS_X265, "libx265 encoder not available")
+    async def test_retags_hevc_hev1_to_hvc1(self) -> None:
+        out = Path("/tmp/_ensure_hev1.mp4")
+        self.addCleanup(lambda: out.unlink(missing_ok=True))
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=10",
+                "-c:v", "libx265", "-tag:v", "hev1", "-f", "mp4", str(out),
+            ],
+            check=True,
+        )
+        # Apple-incompatible hev1 tag before; faststart but wrong tag.
+        self.assertEqual(faststart._inspect(out)[1], b"hev1")
+
+        old = time.time() - 3600
+        os.utime(out, (old, old))
+
+        self.assertTrue(await faststart.ensure_faststart(out))
+        # Re-tagged to the Apple-compatible hvc1, mtime preserved.
+        self.assertEqual(faststart._inspect(out)[1], b"hvc1")
+        self.assertAlmostEqual(out.stat().st_mtime, old, delta=1)
+        # Now compatible -> no further work.
+        self.assertFalse(await faststart.ensure_faststart(out))
 
 
 if __name__ == "__main__":

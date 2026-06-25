@@ -1,4 +1,4 @@
-"""Convert finalized fragmented-MP4 recordings to a faststart layout.
+"""Normalize finalized recordings for web playback (faststart + HEVC tag).
 
 Segments are recorded as fragmented MP4 (``empty_moov + frag_keyframe``, see
 ``recorder._ffmpeg_args``) so the live segment is playable while ffmpeg is
@@ -7,10 +7,17 @@ its header and no fragment index (``sidx``). A browser opening one has to walk
 *every* ``moof`` box scattered across the whole file before it can learn the
 duration or seek — i.e. it downloads the entire file before playout.
 
-Once a segment is finalized we remux it (stream-copy, near-instant) into a
-normal faststart MP4: a single ``moov`` carrying the real duration and the
-sample/seek tables placed before ``mdat``. The browser then reads a few KB of
-header and streams/seeks the rest via HTTP range requests.
+A second, codec-level problem hits HEVC cameras: ffmpeg's muxer tags HEVC
+video as ``hev1`` (parameter sets in-band). Apple's decoders (Safari, iOS,
+QuickTime) only play HEVC tagged ``hvc1`` (parameter sets out-of-band in the
+``hvcC`` box); Chrome accepts both, so a recording plays on desktop Chrome but
+shows the "unsupported" slash-play icon on an iPhone.
+
+Once a segment is finalized we remux it (stream-copy, near-instant) to fix
+both: a single ``moov`` carrying the real duration and the sample/seek tables
+placed before ``mdat`` (faststart), and ``-tag:v hvc1`` for HEVC streams. The
+browser then reads a few KB of header and streams/seeks the rest via HTTP
+range requests, and Apple devices can decode it.
 
 The remux is in-place and atomic (write to a temp file, ``os.replace``), and
 the original mtime is restored so retention bookkeeping (which keys off mtime)
@@ -30,58 +37,81 @@ logger = logging.getLogger(__name__)
 # file-listing walks (which match ``*.mp4``) ignore an in-flight conversion.
 _TMP_SUFFIX = ".faststart.tmp"
 
+# Video sample-entry fourccs we recognize, searched for in the moov box.
+_HEVC_FOURCCS = (b"hvc1", b"hev1")
+_KNOWN_FOURCCS = (b"hvc1", b"hev1", b"avc1")
 
-def is_fragmented(path: Path) -> bool:
-    """True if ``path`` is a fragmented MP4 (contains a top-level ``moof``).
 
-    Walks only the top-level box headers — it reads 8–16 bytes per box and
-    seeks over the payloads, so it never reads the (large) ``mdat`` data. A
-    faststart file is just ``ftyp/moov/mdat`` so this returns after three
-    cheap seeks; a fragmented file hits its first ``moof`` (the third box)
-    immediately. Returns False on any parse/IO error — callers treat
-    "unknown" as "leave it alone".
+def _inspect(path: Path) -> tuple[bool, bytes | None]:
+    """Return ``(fragmented, video_fourcc)`` for an MP4.
+
+    Walks the top-level boxes (reading headers and seeking over payloads, so
+    it never touches the large ``mdat`` bytes) to detect a ``moof`` box. When
+    it reaches ``moov`` it reads that (small) box and scans it for a known
+    video sample-entry fourcc. Returns ``(False, None)`` on any parse/IO
+    error — callers treat "unknown" as "leave it alone".
     """
+    fragmented = False
+    fourcc: bytes | None = None
     try:
         with open(path, "rb") as f:
-            # Cap the walk; a well-formed faststart file has a handful of
-            # top-level boxes, and we only need to reach the first moof.
             for _ in range(10_000):
                 header = f.read(8)
                 if len(header) < 8:
-                    return False
+                    break
                 size = struct.unpack(">I", header[:4])[0]
                 box_type = header[4:8]
-                if box_type == b"moof":
-                    return True
                 if size == 1:
-                    # 64-bit extended size follows the type.
                     ext = f.read(8)
                     if len(ext) < 8:
-                        return False
+                        break
                     size = struct.unpack(">Q", ext)[0]
                     payload = size - 16
                 elif size == 0:
                     # Box runs to EOF — it's the last one.
-                    return False
+                    payload = None
                 else:
                     payload = size - 8
-                if payload < 0:
-                    return False
+                if box_type == b"moof":
+                    fragmented = True
+                    # moov precedes moof in our files, so once we've also got
+                    # the fourcc there's nothing left to learn.
+                    if fourcc is not None:
+                        break
+                if box_type == b"moov":
+                    data = f.read(payload if payload is not None else -1)
+                    for fc in _KNOWN_FOURCCS:
+                        if fc in data:
+                            fourcc = fc
+                            break
+                    continue  # already advanced past the payload
+                if payload is None or payload < 0:
+                    break
                 f.seek(payload, os.SEEK_CUR)
-        return False
     except OSError as e:
         logger.warning("faststart: could not inspect %s: %s", path, e)
-        return False
+        return False, None
+    return fragmented, fourcc
+
+
+def is_fragmented(path: Path) -> bool:
+    """True if ``path`` is a fragmented MP4 (contains a top-level ``moof``)."""
+    return _inspect(path)[0]
 
 
 async def ensure_faststart(path: Path) -> bool:
-    """Remux ``path`` in place to a faststart MP4 if it is fragmented.
+    """Remux ``path`` in place so it is web-playable, if it isn't already.
 
-    Returns True if a conversion happened, False if the file was already
-    faststart or the conversion failed (failures are logged; the original
-    file is always left intact).
+    Converts when the file is fragmented (needs faststart) or is HEVC tagged
+    ``hev1`` (needs the Apple-compatible ``hvc1`` tag). Returns True if a
+    conversion happened, False if the file was already fine or the conversion
+    failed (failures are logged; the original file is always left intact).
     """
-    if not await asyncio.to_thread(is_fragmented, path):
+    fragmented, fourcc = await asyncio.to_thread(_inspect, path)
+    is_hevc = fourcc in _HEVC_FOURCCS
+    needs_faststart = fragmented
+    needs_retag = fourcc == b"hev1"
+    if not needs_faststart and not needs_retag:
         return False
 
     try:
@@ -102,6 +132,10 @@ async def ensure_faststart(path: Path) -> bool:
         str(path),
         "-c",
         "copy",
+        # Apple decoders require HEVC tagged hvc1 (with out-of-band parameter
+        # sets); this is a lossless re-tag, applied only to HEVC streams so
+        # H.264 (avc1) recordings are untouched.
+        *(["-tag:v", "hvc1"] if is_hevc else []),
         "-movflags",
         "+faststart",
         # The temp name doesn't end in .mp4, so ffmpeg can't infer the
