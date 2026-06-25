@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Video } from "lucide-react";
+import { AlertTriangle, Video, X } from "lucide-react";
 import type { ServiceStatus } from "./types";
 import { api } from "./api";
 import { Header } from "./components/Header";
@@ -22,6 +22,7 @@ function Dashboard() {
   const [selected, setSelected] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [toggling, setToggling] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const pollTimer = useRef<number | undefined>(undefined);
 
   const refresh = useCallback(async () => {
@@ -81,6 +82,23 @@ function Dashboard() {
     await refresh();
   }
 
+  // Close the mobile drawer on Escape, mirroring the modal dismissals.
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDrawerOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [drawerOpen]);
+
+  const selectStream = useCallback((name: string) => {
+    setSelected(name);
+    // On mobile the list lives in an overlay drawer; picking a stream should
+    // dismiss it so the detail is visible. No-op on desktop where it's static.
+    setDrawerOpen(false);
+  }, []);
+
   const selectedStream =
     status?.streams.find((s) => s.name === selected) ?? null;
 
@@ -97,6 +115,7 @@ function Dashboard() {
         running={status?.running ?? false}
         busy={toggling}
         onToggle={toggleRunning}
+        onMenu={() => setDrawerOpen(true)}
       />
 
       {error && (
@@ -106,14 +125,41 @@ function Dashboard() {
         </div>
       )}
 
-      <main className="flex-1 min-h-0 grid grid-cols-[240px_1fr] md:grid-cols-[280px_1fr] xl:grid-cols-[320px_1fr]">
-        <aside className="border-r border-white/[0.06] flex flex-col min-h-0">
+      <main className="flex-1 min-h-0 md:grid md:grid-cols-[280px_1fr] xl:grid-cols-[320px_1fr]">
+        {/* Mobile-only scrim behind the drawer. */}
+        {drawerOpen && (
+          <div
+            className="fixed inset-0 z-30 bg-ink-950/70 backdrop-blur-sm md:hidden"
+            onClick={() => setDrawerOpen(false)}
+            aria-hidden
+          />
+        )}
+        <aside
+          className={`border-white/[0.06] flex flex-col min-h-0 bg-ink-900
+            fixed inset-y-0 left-0 z-40 w-[85%] max-w-xs border-r shadow-2xl
+            transform transition-transform duration-200 ease-out
+            ${drawerOpen ? "translate-x-0" : "-translate-x-full"}
+            md:static md:z-auto md:w-auto md:max-w-none md:translate-x-0
+            md:shadow-none md:bg-transparent md:transition-none`}
+        >
+          <div className="flex items-center justify-end px-2 h-12 border-b border-white/[0.06] md:hidden">
+            <button
+              onClick={() => setDrawerOpen(false)}
+              className="inline-flex items-center justify-center h-10 w-10 rounded-lg text-ink-300 hover:text-ink-100 hover:bg-white/[0.06]"
+              aria-label="Close menu"
+            >
+              <X size={18} />
+            </button>
+          </div>
           <div className="flex-1 min-h-0">
             <StreamList
               streams={status?.streams ?? []}
               selected={selected}
-              onSelect={setSelected}
-              onAdd={() => setAddOpen(true)}
+              onSelect={selectStream}
+              onAdd={() => {
+                setDrawerOpen(false);
+                setAddOpen(true);
+              }}
             />
           </div>
           {status && (

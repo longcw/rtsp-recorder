@@ -102,7 +102,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4"
       role="dialog"
       aria-modal
       aria-label={`Playing ${file.name}`}
@@ -112,7 +112,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
         onClick={onClose}
       />
 
-      <div className="relative w-full max-w-4xl card overflow-hidden flex flex-col max-h-[90vh]">
+      <div className="relative w-full h-full sm:h-auto max-w-4xl card rounded-none sm:rounded-xl overflow-hidden flex flex-col max-h-[100dvh] sm:max-h-[90vh]">
         <div className="flex items-center justify-between gap-4 px-4 py-2.5 border-b border-white/[0.06]">
           <div className="min-w-0 flex items-center gap-2.5">
             {live && (
@@ -140,23 +140,23 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
             <a
               href={url}
               download
-              className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
+              className="inline-flex items-center justify-center h-9 w-9 sm:h-7 sm:w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
               title="Download"
             >
-              <Download size={14} />
+              <Download size={16} />
             </a>
             <button
-              className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
+              className="inline-flex items-center justify-center h-9 w-9 sm:h-7 sm:w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"
               onClick={onClose}
               aria-label="Close"
               title="Close (Esc)"
             >
-              <X size={15} />
+              <X size={17} />
             </button>
           </div>
         </div>
 
-        <div className="bg-black flex items-center justify-center">
+        <div className="flex-1 min-h-0 sm:flex-none bg-black flex items-center justify-center">
           <video
             ref={videoRef}
             src={url}
@@ -172,7 +172,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
               // the user's choice so it survives autoplay/metadata load.
               e.currentTarget.playbackRate = rate;
             }}
-            className="w-full max-h-[70vh]"
+            className="w-full h-full object-contain sm:h-auto sm:max-h-[70vh]"
           />
         </div>
 
@@ -221,7 +221,7 @@ function SpeedBar({
               onClick={() => onChange(s)}
               aria-pressed={active}
               className={
-                "font-mono text-xs rounded px-2 py-0.5 border " +
+                "font-mono text-xs rounded px-3 py-1.5 sm:px-2 sm:py-0.5 border " +
                 (active
                   ? "bg-white/[0.10] border-white/[0.14] text-ink-100"
                   : "bg-white/[0.02] border-white/[0.06] text-ink-300 hover:bg-white/[0.06] hover:text-ink-100")

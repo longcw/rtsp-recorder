@@ -1,15 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import {
   Activity,
   AlertTriangle,
   Download,
   Loader2,
   Moon,
+  MoreVertical,
   Pause,
   Play,
   PlayCircle,
   RotateCw,
   ScanSearch,
+  Sun,
   Trash2,
   X,
 } from "lucide-react";
@@ -272,7 +274,8 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
               the first segment (≈1 min).
             </div>
           ) : (
-            <table className="w-full text-sm">
+            <>
+            <table className="w-full text-sm hidden md:table">
               <thead className="sticky top-0 bg-ink-900/95 backdrop-blur border-b border-white/[0.06]">
                 <tr className="text-left">
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider">
@@ -303,50 +306,11 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                     >
                       <td className="px-4 py-2.5 max-w-0">
                         <div className="flex items-center gap-2 min-w-0">
-                          {live ? (
-                            <span className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse-dot" />
-                              REC
-                            </span>
-                          ) : f.analyzing ? (
-                            <span
-                              className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-sky-500/10 border border-sky-400/25 text-sky-200 text-[10px] font-semibold uppercase tracking-wider shrink-0 tabular-nums"
-                              title="Analyzing this recording for motion."
-                            >
-                              <Loader2 size={10} className="animate-spin" />
-                              {f.analyze_progress != null
-                                ? `Scanning ${Math.round(f.analyze_progress * 100)}%`
-                                : "Scanning"}
-                            </span>
-                          ) : f.idle === true ? (
-                            <span
-                              className="inline-flex items-center gap-1 pl-1.5 pr-0.5 h-5 rounded-md bg-indigo-500/10 border border-indigo-400/25 text-indigo-200 text-[10px] font-semibold uppercase tracking-wider shrink-0"
-                              title="No motion detected. Will be pruned on the idle retention schedule. Click X if this is wrong."
-                            >
-                              <Moon size={10} />
-                              Idle
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setIdle(f.name, false);
-                                }}
-                                className="ml-0.5 mr-0.5 inline-flex items-center justify-center h-3.5 w-3.5 rounded hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-100"
-                                aria-label="Mark as not idle"
-                                title="Mark as not idle"
-                              >
-                                <X size={10} />
-                              </button>
-                            </span>
-                          ) : f.idle === false ? (
-                            <span
-                              className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-amber-400/8 border border-amber-400/20 text-amber-200/90 text-[10px] font-semibold uppercase tracking-wider shrink-0"
-                              title="Motion detected. Kept on the regular retention schedule."
-                            >
-                              <Activity size={10} />
-                              Action
-                            </span>
-                          ) : null}
+                          <RecordingBadge
+                            file={f}
+                            live={live}
+                            onMarkNotIdle={() => setIdle(f.name, false)}
+                          />
                           <div className="min-w-0">
                             <div className="text-ink-100 tabular-nums truncate">
                               {range.primary}
@@ -448,6 +412,55 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                 })}
               </tbody>
             </table>
+
+            {/* Mobile: tap a card to play; actions live in the ⋮ menu. */}
+            <ul className="md:hidden divide-y divide-white/[0.04]">
+              {(files ?? []).map((f) => {
+                const live = f.name === stream.current_file;
+                const range = formatTimeRange(f, live);
+                return (
+                  <li
+                    key={f.name}
+                    onClick={() => setPlaying(f)}
+                    className={`flex items-center gap-2 px-3 py-3 cursor-pointer ${
+                      live ? "bg-emerald-500/[0.04]" : "active:bg-white/[0.04]"
+                    }`}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <RecordingBadge
+                          file={f}
+                          live={live}
+                          onMarkNotIdle={() => setIdle(f.name, false)}
+                        />
+                        <span className="text-ink-100 tabular-nums truncate">
+                          {range.primary}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[11px] text-ink-400 flex items-center gap-1.5 flex-wrap">
+                        {range.dateLabel && <span>{range.dateLabel}</span>}
+                        <span className="text-ink-500">·</span>
+                        <span className="tabular-nums">
+                          {formatDuration(f.duration_seconds)}
+                        </span>
+                        <span className="text-ink-500">·</span>
+                        <span className="tabular-nums">{formatBytes(f.size)}</span>
+                      </div>
+                    </div>
+                    <RecordingMenu
+                      downloadUrl={api.fileUrl(stream.name, f.name)}
+                      live={live}
+                      isIdle={f.idle === true}
+                      onMarkIdle={() => setIdle(f.name, true)}
+                      onMarkNotIdle={() => setIdle(f.name, false)}
+                      onRescan={() => rescanFile(f.name)}
+                      onDelete={() => setConfirmDeleteFile(f)}
+                    />
+                  </li>
+                );
+              })}
+            </ul>
+            </>
           )}
         </div>
       </div>
@@ -527,6 +540,208 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
               </button>
             </div>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecordingBadge({
+  file: f,
+  live,
+  onMarkNotIdle,
+}: {
+  file: RecordingFile;
+  live: boolean;
+  onMarkNotIdle: () => void;
+}) {
+  if (live) {
+    return (
+      <span className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-[10px] font-semibold uppercase tracking-wider shrink-0">
+        <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse-dot" />
+        REC
+      </span>
+    );
+  }
+  if (f.analyzing) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-sky-500/10 border border-sky-400/25 text-sky-200 text-[10px] font-semibold uppercase tracking-wider shrink-0 tabular-nums"
+        title="Analyzing this recording for motion."
+      >
+        <Loader2 size={10} className="animate-spin" />
+        {f.analyze_progress != null
+          ? `Scanning ${Math.round(f.analyze_progress * 100)}%`
+          : "Scanning"}
+      </span>
+    );
+  }
+  if (f.idle === true) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 pl-1.5 pr-0.5 h-5 rounded-md bg-indigo-500/10 border border-indigo-400/25 text-indigo-200 text-[10px] font-semibold uppercase tracking-wider shrink-0"
+        title="No motion detected. Will be pruned on the idle retention schedule. Click X if this is wrong."
+      >
+        <Moon size={10} />
+        Idle
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onMarkNotIdle();
+          }}
+          className="ml-0.5 mr-0.5 inline-flex items-center justify-center h-3.5 w-3.5 rounded hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-100"
+          aria-label="Mark as not idle"
+          title="Mark as not idle"
+        >
+          <X size={10} />
+        </button>
+      </span>
+    );
+  }
+  if (f.idle === false) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 px-1.5 h-5 rounded-md bg-amber-400/8 border border-amber-400/20 text-amber-200/90 text-[10px] font-semibold uppercase tracking-wider shrink-0"
+        title="Motion detected. Kept on the regular retention schedule."
+      >
+        <Activity size={10} />
+        Action
+      </span>
+    );
+  }
+  return null;
+}
+
+function RecordingMenu({
+  downloadUrl,
+  live,
+  isIdle,
+  onMarkIdle,
+  onMarkNotIdle,
+  onRescan,
+  onDelete,
+}: {
+  downloadUrl: string;
+  live: boolean;
+  isIdle: boolean;
+  onMarkIdle: () => void;
+  onMarkNotIdle: () => void;
+  onRescan: () => void;
+  onDelete: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  // Fixed-viewport coords so the menu escapes the recordings list's
+  // `overflow-y-auto` clip; flips above the button when near the bottom.
+  const [pos, setPos] = useState<{ right: number; top?: number; bottom?: number }>(
+    { right: 0 },
+  );
+  const ref = useRef<HTMLDivElement | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) close();
+    };
+    document.addEventListener("mousedown", onDocClick);
+    // The menu is viewport-fixed, so it can't follow a scroll — dismiss it.
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [open]);
+
+  function toggle(e: ReactMouseEvent) {
+    e.stopPropagation();
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    const r = btnRef.current!.getBoundingClientRect();
+    const openUp = r.bottom > window.innerHeight - 260;
+    setPos({
+      right: window.innerWidth - r.right,
+      ...(openUp
+        ? { bottom: window.innerHeight - r.top + 6 }
+        : { top: r.bottom + 6 }),
+    });
+    setOpen(true);
+  }
+
+  // Stop card-tap (play) from firing for anything inside the menu.
+  const run = (fn: () => void) => (e: ReactMouseEvent) => {
+    e.stopPropagation();
+    setOpen(false);
+    fn();
+  };
+
+  return (
+    <div ref={ref} className="shrink-0" onClick={(e) => e.stopPropagation()}>
+      <button
+        ref={btnRef}
+        type="button"
+        onClick={toggle}
+        className="inline-flex items-center justify-center h-10 w-10 rounded-lg text-ink-300 hover:text-ink-100 hover:bg-white/[0.06]"
+        aria-label="Recording actions"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <MoreVertical size={18} />
+      </button>
+      {open && (
+        <div
+          role="menu"
+          style={{ right: pos.right, top: pos.top, bottom: pos.bottom }}
+          className="fixed z-50 min-w-[11rem] rounded-lg border border-white/[0.08] bg-ink-800 shadow-2xl py-1"
+        >
+          <a
+            href={downloadUrl}
+            download
+            onClick={run(() => {})}
+            className="flex items-center gap-2.5 px-3 py-2.5 text-sm text-ink-200 hover:bg-white/[0.06]"
+            role="menuitem"
+          >
+            <Download size={15} />
+            {live ? "Download in-progress copy" : "Download"}
+          </a>
+          {!live && (
+            <button
+              type="button"
+              onClick={run(isIdle ? onMarkNotIdle : onMarkIdle)}
+              className="w-full flex items-center gap-2.5 px-3 py-2.5 text-sm text-ink-200 hover:bg-white/[0.06]"
+              role="menuitem"
+            >
+              {isIdle ? <Sun size={15} /> : <Moon size={15} />}
+              {isIdle ? "Mark as not idle" : "Mark as idle"}
+            </button>
+          )}
+          {!live && (
+            <button
+              type="button"
+              onClick={run(onRescan)}
+              className="w-full flex items-center gap-2.5 px-3 py-2.5 text-sm text-ink-200 hover:bg-white/[0.06]"
+              role="menuitem"
+            >
+              <RotateCw size={15} />
+              Re-scan for motion
+            </button>
+          )}
+          {!live && (
+            <button
+              type="button"
+              onClick={run(onDelete)}
+              className="w-full flex items-center gap-2.5 px-3 py-2.5 text-sm text-rose-300 hover:bg-rose-500/15"
+              role="menuitem"
+            >
+              <Trash2 size={15} />
+              Delete
+            </button>
+          )}
         </div>
       )}
     </div>
