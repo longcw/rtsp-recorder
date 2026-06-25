@@ -35,6 +35,12 @@ RESTART_BACKOFF_SECONDS = 5.0
 # phase, where no segment file exists yet for the watchdog to stat).
 FFMPEG_SOCKET_TIMEOUT_US = 10_000_000
 
+# Hard cap on the one-shot codec probe (ffprobe) we run before recording so a
+# slow/unreachable camera can't stall startup. The socket timeout above makes
+# ffprobe bail on a dead connection well before this; this just bounds the
+# worst case.
+PROBE_TIMEOUT_SECONDS = 20.0
+
 # After asking ffmpeg to exit (SIGTERM) we wait this long before escalating to
 # SIGKILL. A network-hung ffmpeg blocked on a dead socket does not honour
 # SIGTERM promptly — its handler only sets a flag the main loop polls between
@@ -84,6 +90,9 @@ class StreamRecorder:
         self._last_error: str | None = None
         self._restart_count: int = 0
         self._current_file: str | None = None
+        # Input video codec, probed once on first launch and cached. Drives the
+        # HEVC hvc1 tagging below; None until a probe succeeds.
+        self._video_codec: str | None = None
         # Once True, subsequent failures present as "reconnecting" rather than
         # "error" so the UI can distinguish never-worked from lost-connection.
         self._has_recorded: bool = False
@@ -177,6 +186,17 @@ class StreamRecorder:
 
     async def _run_ffmpeg_once(self) -> int:
         pattern = str(self.dir / "%Y-%m-%d_%H-%M-%S.mp4")
+        # Probe the input codec once (cached) so we know whether to tag the
+        # output HEVC as hvc1 — see _ffmpeg_args. Best-effort: on failure we
+        # record untagged and the faststart loop re-tags finalized segments.
+        if self._video_codec is None:
+            self._video_codec = await self._probe_video_codec()
+            if self._video_codec:
+                logger.info(
+                    "recorder %s: input video codec=%s",
+                    self.stream.name,
+                    self._video_codec,
+                )
         args = self._ffmpeg_args(pattern)
         env = {**os.environ, "TZ": self.tz}
         logger.info(
@@ -346,6 +366,56 @@ class StreamRecorder:
         except Exception:  # pragma: no cover - defensive
             pass
 
+    async def _probe_video_codec(self) -> str | None:
+        """Return the input's video codec name (e.g. "hevc", "h264"), or None.
+
+        Runs a short, sequential ffprobe before the recording ffmpeg starts —
+        no second concurrent RTSP connection. Bounded by the socket timeout and
+        a hard wall-clock cap so an unreachable camera can't stall startup.
+        """
+        args = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-timeout",
+            str(FFMPEG_SOCKET_TIMEOUT_US),
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            self.stream.url,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError as e:
+            logger.warning("recorder %s: ffprobe failed to launch: %s", self.stream.name, e)
+            return None
+        try:
+            out, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=PROBE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning("recorder %s: codec probe timed out", self.stream.name)
+            try:
+                proc.kill()
+                await proc.wait()
+            except (ProcessLookupError, Exception):
+                pass
+            return None
+        if proc.returncode != 0:
+            return None
+        codec = out.decode(errors="replace").strip().splitlines()
+        return codec[0].strip() if codec and codec[0].strip() else None
+
     def _ffmpeg_args(self, pattern: str) -> list[str]:
         return [
             "ffmpeg",
@@ -370,6 +440,11 @@ class StreamRecorder:
             "-c",
             "copy",
             "-an",  # no audio for now; many RTSP cameras have problematic audio
+            # Apple decoders (Safari/iOS) only play HEVC tagged hvc1, not the
+            # hev1 ffmpeg emits by default. Tag it here so even the live
+            # in-progress segment is iPhone-playable. HEVC-only — tagging an
+            # H.264 stream hvc1 would produce a broken file.
+            *(["-tag:v", "hvc1"] if self._video_codec == "hevc" else []),
             "-f",
             "segment",
             "-segment_time",
