@@ -20,11 +20,60 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
   const [clipEnd, setClipEnd] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
   const [rate, setRate] = useState(1);
+  // Timer that makes up the speed above the browser's native playbackRate cap
+  // (~16x) by advancing currentTime. See applyRate.
+  const fastTimer = useRef<number | undefined>(undefined);
+
+  // Apply a logical rate to the element. Up to the native cap we just set
+  // playbackRate; beyond it the browser clamps, so we cover the shortfall by
+  // stepping currentTime forward on a timer (cheap on faststart/keyframe
+  // files). Re-engaged on play, torn down on pause/unmount.
+  function applyRate(r: number) {
+    const v = videoRef.current;
+    if (!v) return;
+    if (fastTimer.current !== undefined) {
+      window.clearInterval(fastTimer.current);
+      fastTimer.current = undefined;
+    }
+    // Browsers reject playbackRate outside their supported range (Chrome
+    // throws above 16x rather than clamping), so cap what we hand the element
+    // and make up the rest with the timer below.
+    let native = Math.min(r, NATIVE_MAX_RATE);
+    try {
+      v.playbackRate = native;
+    } catch {
+      // This browser's cap is even lower (e.g. older Safari) — fall back to
+      // 1x and let the timer carry the whole speed-up.
+      native = 1;
+      try {
+        v.playbackRate = 1;
+      } catch {
+        /* leave whatever the element had */
+      }
+    }
+    const extra = Math.max(0, r - v.playbackRate);
+    if (extra > 0.5 && !v.paused) {
+      const stepMs = 250;
+      fastTimer.current = window.setInterval(() => {
+        const el = videoRef.current;
+        if (!el) return;
+        const next = el.currentTime + (extra * stepMs) / 1000;
+        if (el.duration && next >= el.duration) {
+          el.currentTime = el.duration;
+          if (fastTimer.current !== undefined) {
+            window.clearInterval(fastTimer.current);
+            fastTimer.current = undefined;
+          }
+        } else {
+          el.currentTime = next;
+        }
+      }, stepMs);
+    }
+  }
 
   function changeRate(r: number) {
     setRate(r);
-    const v = videoRef.current;
-    if (v) v.playbackRate = r;
+    applyRate(r);
   }
 
   useEffect(() => {
@@ -34,6 +83,15 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // Tear down the fast-forward timer when the player closes.
+  useEffect(() => {
+    return () => {
+      if (fastTimer.current !== undefined) {
+        window.clearInterval(fastTimer.current);
+      }
+    };
+  }, []);
 
   const url = api.fileUrl(streamName, file.name);
   const subtitle = formatSubtitle(file);
@@ -164,13 +222,21 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
             autoPlay
             playsInline
             onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-            onRateChange={(e) => setRate(e.currentTarget.playbackRate)}
+            // Re-engage the fast-forward timer on resume; drop it on pause so
+            // a paused video doesn't keep seeking.
+            onPlay={() => applyRate(rate)}
+            onPause={() => {
+              if (fastTimer.current !== undefined) {
+                window.clearInterval(fastTimer.current);
+                fastTimer.current = undefined;
+              }
+            }}
             onLoadedMetadata={(e) => {
               const d = e.currentTarget.duration;
               setDuration(Number.isFinite(d) ? d : null);
               // Browsers reset playbackRate when a new source loads; re-apply
               // the user's choice so it survives autoplay/metadata load.
-              e.currentTarget.playbackRate = rate;
+              applyRate(rate);
             }}
             className="w-full h-full object-contain sm:h-auto sm:max-h-[70vh]"
           />
@@ -197,7 +263,10 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
   );
 }
 
-const SPEEDS = [1, 2, 4, 8, 16];
+const SPEEDS = [1, 2, 4, 8, 16, 32, 64];
+// Most browsers cap HTMLMediaElement.playbackRate at 16x; above this we drive
+// playback by stepping currentTime on a timer (see applyRate).
+const NATIVE_MAX_RATE = 16;
 
 function SpeedBar({
   rate,
@@ -207,12 +276,12 @@ function SpeedBar({
   onChange: (r: number) => void;
 }) {
   return (
-    <div className="border-t border-white/[0.06] px-4 py-2 flex items-center gap-2">
+    <div className="border-t border-white/[0.06] px-4 py-2 flex items-center gap-2 flex-wrap">
       <Gauge size={14} className="text-ink-300 shrink-0" />
       <span className="text-[11px] uppercase tracking-wider text-ink-500 shrink-0">
         Speed
       </span>
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-1 flex-wrap">
         {SPEEDS.map((s) => {
           const active = s === rate;
           return (
