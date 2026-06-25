@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Download, Loader2, Scissors, X } from "lucide-react";
+import { Download, Gauge, Loader2, Scissors, X } from "lucide-react";
 import type { RecordingFile } from "../types";
 import { api } from "../api";
 import { useToast } from "./Toast";
@@ -19,6 +19,13 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
   const [clipStart, setClipStart] = useState<number | null>(null);
   const [clipEnd, setClipEnd] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [rate, setRate] = useState(1);
+
+  function changeRate(r: number) {
+    setRate(r);
+    const v = videoRef.current;
+    if (v) v.playbackRate = r;
+  }
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -157,13 +164,19 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
             autoPlay
             playsInline
             onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+            onRateChange={(e) => setRate(e.currentTarget.playbackRate)}
             onLoadedMetadata={(e) => {
               const d = e.currentTarget.duration;
               setDuration(Number.isFinite(d) ? d : null);
+              // Browsers reset playbackRate when a new source loads; re-apply
+              // the user's choice so it survives autoplay/metadata load.
+              e.currentTarget.playbackRate = rate;
             }}
             className="w-full max-h-[70vh]"
           />
         </div>
+
+        <SpeedBar rate={rate} onChange={changeRate} />
 
         <TrimBar
           currentTime={currentTime}
@@ -179,6 +192,45 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
           onClear={clearMarks}
           onExport={exportClip}
         />
+      </div>
+    </div>
+  );
+}
+
+const SPEEDS = [1, 2, 4, 8, 16];
+
+function SpeedBar({
+  rate,
+  onChange,
+}: {
+  rate: number;
+  onChange: (r: number) => void;
+}) {
+  return (
+    <div className="border-t border-white/[0.06] px-4 py-2 flex items-center gap-2">
+      <Gauge size={14} className="text-ink-300 shrink-0" />
+      <span className="text-[11px] uppercase tracking-wider text-ink-500 shrink-0">
+        Speed
+      </span>
+      <div className="flex items-center gap-1">
+        {SPEEDS.map((s) => {
+          const active = s === rate;
+          return (
+            <button
+              key={s}
+              onClick={() => onChange(s)}
+              aria-pressed={active}
+              className={
+                "font-mono text-xs rounded px-2 py-0.5 border " +
+                (active
+                  ? "bg-white/[0.10] border-white/[0.14] text-ink-100"
+                  : "bg-white/[0.02] border-white/[0.06] text-ink-300 hover:bg-white/[0.06] hover:text-ink-100")
+              }
+            >
+              {s}×
+            </button>
+          );
+        })}
       </div>
     </div>
   );

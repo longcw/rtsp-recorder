@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import idle_index
+from . import faststart, idle_index
 from .config import ConfigStore
 from .idle_detector import analyze
 from .models import Config, Stream, ServiceStatus
@@ -20,6 +20,10 @@ ANALYZE_INTERVAL_SECONDS = 30
 # A file is considered "still being written" if its mtime advanced this
 # recently. Skip such files in the analyzer to avoid reading a partial moov.
 ANALYZE_MIN_AGE_SECONDS = 15
+FASTSTART_INTERVAL_SECONDS = 60
+# Same settled-file guard as the analyzer: never remux a segment whose mtime
+# is still advancing (the live segment, or one that just rotated).
+FASTSTART_MIN_AGE_SECONDS = ANALYZE_MIN_AGE_SECONDS
 
 
 class RecorderManager:
@@ -40,6 +44,8 @@ class RecorderManager:
         self._analyze_task: asyncio.Task[None] | None = None
         self._analyze_stop = asyncio.Event()
         self._analyze_wake = asyncio.Event()
+        self._faststart_task: asyncio.Task[None] | None = None
+        self._faststart_stop = asyncio.Event()
         # (stream_name, filename) of the file currently being analyzed, or
         # None when the analyzer is between files. Read by the API to mark
         # the in-flight row in the UI; written only from `_analyze_pending`
@@ -61,12 +67,17 @@ class RecorderManager:
         self._analyze_task = asyncio.create_task(
             self._analyze_loop(), name="analyzer"
         )
+        self._faststart_stop.clear()
+        self._faststart_task = asyncio.create_task(
+            self._faststart_loop(), name="faststart"
+        )
 
     async def shutdown(self) -> None:
         self._prune_stop.set()
         self._prune_wake.set()
         self._analyze_stop.set()
         self._analyze_wake.set()
+        self._faststart_stop.set()
         if self._prune_task:
             try:
                 await asyncio.wait_for(self._prune_task, timeout=5)
@@ -77,6 +88,11 @@ class RecorderManager:
                 await asyncio.wait_for(self._analyze_task, timeout=5)
             except asyncio.TimeoutError:
                 self._analyze_task.cancel()
+        if self._faststart_task:
+            try:
+                await asyncio.wait_for(self._faststart_task, timeout=5)
+            except asyncio.TimeoutError:
+                self._faststart_task.cancel()
         async with self._lock:
             await asyncio.gather(
                 *(r.stop() for r in self._recorders.values()), return_exceptions=True
@@ -454,6 +470,67 @@ class RecorderManager:
                     preserved_idle,
                     result.duration_seconds,
                 )
+
+
+    # ---- faststart loop ----
+
+    async def _faststart_loop(self) -> None:
+        """Remux finalized fragmented segments into faststart layout.
+
+        Each tick walks every stream directory and converts any settled .mp4
+        that is still fragmented (see `faststart`). On the first tick this
+        backfills every pre-existing recording; thereafter it picks up each
+        segment shortly after it rotates. The live segment is never touched —
+        it's skipped both by mtime age and by matching the recorder's
+        currently-open file.
+        """
+        while not self._faststart_stop.is_set():
+            try:
+                await self._faststart_pending()
+            except Exception:
+                logger.exception("faststart: tick failed")
+
+            try:
+                await asyncio.wait_for(
+                    self._faststart_stop.wait(),
+                    timeout=FASTSTART_INTERVAL_SECONDS,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+
+    async def _faststart_pending(self) -> None:
+        if not self.recordings_dir.exists():
+            return
+        # Files a recorder is actively writing — never remux these even if the
+        # mtime guard somehow lets one through.
+        live = {
+            r.status().current_file
+            for r in self._recorders.values()
+            if r.status().current_file
+        }
+        now = time.time()
+        converted = 0
+        for stream_dir in self.recordings_dir.iterdir():
+            if not stream_dir.is_dir():
+                continue
+            for f in sorted(stream_dir.iterdir()):
+                if self._faststart_stop.is_set():
+                    return
+                if not f.is_file() or not f.name.endswith(".mp4"):
+                    continue
+                if f.name in live:
+                    continue
+                try:
+                    st = f.stat()
+                except FileNotFoundError:
+                    continue
+                if now - st.st_mtime < FASTSTART_MIN_AGE_SECONDS:
+                    continue
+                if await faststart.ensure_faststart(f):
+                    converted += 1
+        if converted:
+            logger.info("faststart: converted %d segment(s)", converted)
 
 
 def rec_status_for_inactive(stream: Stream, *, running: bool):
