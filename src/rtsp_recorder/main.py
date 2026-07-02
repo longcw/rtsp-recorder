@@ -386,6 +386,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         filename: str,
         start: float = Query(..., ge=0.0),
         end: float = Query(..., gt=0.0),
+        speed: float = Query(1.0, ge=1.0, le=64.0),
     ):
         if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
             raise HTTPException(status_code=400, detail="invalid filename")
@@ -411,10 +412,29 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         # because MP4 needs the moov atom, which non-fragmented output writes
         # at the end after seeking the file.
         stem = filename.rsplit(".", 1)[0]
-        suffix = f"_clip_{int(round(start))}-{int(round(end))}.mp4"
+        speed_tag = "" if speed <= 1.0 else f"_{speed:g}x"
+        suffix = f"_clip_{int(round(start))}-{int(round(end))}{speed_tag}.mp4"
         out_fd, out_path_str = tempfile.mkstemp(prefix=f"{stem}", suffix=suffix)
         os.close(out_fd)
         out_path = Path(out_path_str)
+
+        if speed <= 1.0:
+            codec_args = [
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+            ]
+        else:
+            # Speeding up needs new timestamps, which means a re-encode. Drop
+            # audio (useless at Nx) and cap the output at 30fps so high speeds
+            # decimate frames instead of encoding every source frame.
+            codec_args = [
+                "-vf", f"setpts=PTS/{speed:g},fps=30",
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+            ]
 
         args = [
             "ffmpeg",
@@ -425,8 +445,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             "-ss", f"{start:.3f}",
             "-to", f"{end:.3f}",
             "-i", str(target),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
+            *codec_args,
             "-movflags", "+faststart",
             str(out_path),
         ]

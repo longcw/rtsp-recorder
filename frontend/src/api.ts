@@ -58,11 +58,13 @@ export const api = {
     file: string,
     startSeconds: number,
     endSeconds: number,
+    speed: number = 1,
   ): Promise<{ blob: Blob; filename: string }> => {
     const url =
       `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}/clip` +
       `?start=${encodeURIComponent(startSeconds.toFixed(3))}` +
-      `&end=${encodeURIComponent(endSeconds.toFixed(3))}`;
+      `&end=${encodeURIComponent(endSeconds.toFixed(3))}` +
+      (speed > 1 ? `&speed=${encodeURIComponent(speed)}` : "");
     const res = await fetch(url);
     if (!res.ok) {
       const text = await res.text().catch(() => "");

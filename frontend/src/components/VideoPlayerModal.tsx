@@ -19,6 +19,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
   const [clipStart, setClipStart] = useState<number | null>(null);
   const [clipEnd, setClipEnd] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [exportSpeed, setExportSpeed] = useState(1);
   const [rate, setRate] = useState(1);
   // Timer that makes up the speed above the browser's native playbackRate cap
   // (~16x) by advancing currentTime. See applyRate.
@@ -135,6 +136,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
         file.name,
         clipStart,
         clipEnd,
+        exportSpeed,
       );
       const objUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -252,6 +254,8 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
           exporting={exporting}
           canExport={canExport}
           clipDuration={clipDuration}
+          exportSpeed={exportSpeed}
+          onExportSpeedChange={setExportSpeed}
           onSetStart={setStartHere}
           onSetEnd={setEndHere}
           onSeek={seekTo}
@@ -313,6 +317,8 @@ interface TrimBarProps {
   exporting: boolean;
   canExport: boolean;
   clipDuration: number | null;
+  exportSpeed: number;
+  onExportSpeedChange: (s: number) => void;
   onSetStart: () => void;
   onSetEnd: () => void;
   onSeek: (s: number) => void;
@@ -328,6 +334,8 @@ function TrimBar({
   exporting,
   canExport,
   clipDuration,
+  exportSpeed,
+  onExportSpeedChange,
   onSetStart,
   onSetEnd,
   onSeek,
@@ -364,6 +372,12 @@ function TrimBar({
         {clipDuration !== null ? (
           <>
             Clip: <span className="text-ink-100">{fmt(clipDuration)}</span>
+            {exportSpeed > 1 && (
+              <span className="text-ink-500">
+                {" "}
+                → {fmt(clipDuration / exportSpeed)}
+              </span>
+            )}
           </>
         ) : (
           <span className="text-ink-500">Set start &amp; end to export</span>
@@ -380,6 +394,20 @@ function TrimBar({
             Reset
           </button>
         )}
+        <select
+          className="font-mono text-xs rounded px-1.5 py-1.5 sm:py-0.5 bg-white/[0.02] border border-white/[0.06] text-ink-300 hover:bg-white/[0.06] hover:text-ink-100 focus:outline-none"
+          value={exportSpeed}
+          onChange={(e) => onExportSpeedChange(Number(e.target.value))}
+          disabled={exporting}
+          title="Export speed (above 1× re-encodes and drops audio)"
+          aria-label="Export speed"
+        >
+          {SPEEDS.map((s) => (
+            <option key={s} value={s}>
+              {s}×
+            </option>
+          ))}
+        </select>
         <button
           className="btn-primary inline-flex items-center gap-1.5 px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
           onClick={onExport}
