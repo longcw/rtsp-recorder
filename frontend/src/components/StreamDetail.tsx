@@ -225,6 +225,19 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
             label="Recordings"
             value={files ? `${files.length} (${formatBytes(totalSize)})` : "…"}
           />
+          <Stat
+            label="Audio"
+            value={
+              stream.has_audio === null
+                ? "—"
+                : stream.has_audio
+                  ? `Yes${stream.audio_codec ? ` (${stream.audio_codec})` : ""}`
+                  : "None"
+            }
+          />
+          {stream.next_retry_at && (
+            <Stat label="Next retry" value={countdown(stream.next_retry_at)} />
+          )}
         </div>
 
         {stream.last_error && (
@@ -795,6 +808,12 @@ function timeAgo(iso: string): string {
   if (h < 24) return `${h}h ago`;
   const d = Math.floor(h / 24);
   return `${d}d ago`;
+}
+
+function countdown(iso: string): string {
+  const s = Math.max(0, Math.round((new Date(iso).getTime() - Date.now()) / 1000));
+  if (s === 0) return "now";
+  return s < 60 ? `in ${s}s` : `in ${Math.round(s / 60)}m`;
 }
 
 function formatDuration(seconds: number | null | undefined): string {

@@ -81,6 +81,15 @@ class StreamStatus(BaseModel):
     last_error: str | None = None
     restart_count: int = 0
     current_file: str | None = None
+    # Whether the source carries usable audio, as of the last probe. None means
+    # we haven't managed to probe yet (camera unreachable since startup).
+    has_audio: bool | None = None
+    # Input audio codec when there is one, e.g. "pcm_alaw". Recorded as AAC
+    # unless MP4 can carry it as-is.
+    audio_codec: str | None = None
+    # When the next reconnect attempt is due, while a stream is down. The delay
+    # backs off as an outage continues, so the UI can show how long the wait is.
+    next_retry_at: datetime | None = None
 
 
 class ServiceStatus(BaseModel):

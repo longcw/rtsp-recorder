@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Download, Gauge, Loader2, Scissors, X } from "lucide-react";
+import { Download, Gauge, Loader2, Scissors, VolumeX, X } from "lucide-react";
 import type { RecordingFile } from "../types";
 import { api } from "../api";
 import { useToast } from "./Toast";
@@ -21,9 +21,44 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
   const [exporting, setExporting] = useState(false);
   const [exportSpeed, setExportSpeed] = useState(1);
   const [rate, setRate] = useState(1);
+  // True when autoplay was only allowed because we muted the element. Drives
+  // the unmute prompt; recordings carry audio whenever the camera sends it.
+  const [autoMuted, setAutoMuted] = useState(false);
+  // Mirrors autoMuted for applyRate, which runs from event handlers that would
+  // otherwise close over a stale value.
+  const policyMuted = useRef(false);
   // Timer that makes up the speed above the browser's native playbackRate cap
   // (~16x) by advancing currentTime. See applyRate.
   const fastTimer = useRef<number | undefined>(undefined);
+
+  // Browsers refuse unmuted autoplay without a user gesture, so a recording
+  // with sound would otherwise sit frozen on its first frame. Try with sound,
+  // and on rejection fall back to muted playback plus a one-tap unmute.
+  async function startPlayback() {
+    const v = videoRef.current;
+    if (!v) return;
+    try {
+      await v.play();
+    } catch {
+      v.muted = true;
+      policyMuted.current = true;
+      setAutoMuted(true);
+      try {
+        await v.play();
+      } catch {
+        // Leave it paused; the native controls can still start it.
+      }
+    }
+  }
+
+  function unmute() {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = false;
+    policyMuted.current = false;
+    setAutoMuted(false);
+    void v.play().catch(() => {});
+  }
 
   // Apply a logical rate to the element. Up to the native cap we just set
   // playbackRate; beyond it the browser clamps, so we cover the shortfall by
@@ -53,6 +88,9 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
       }
     }
     const extra = Math.max(0, r - v.playbackRate);
+    // Above the native cap we advance currentTime by hand, which turns audio
+    // into stutter rather than speech, so silence it until the rate drops back.
+    v.muted = policyMuted.current || extra > 0.5;
     if (extra > 0.5 && !v.paused) {
       const stepMs = 250;
       fastTimer.current = window.setInterval(() => {
@@ -216,12 +254,20 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
           </div>
         </div>
 
-        <div className="flex-1 min-h-0 sm:flex-none bg-black flex items-center justify-center">
+        <div className="relative flex-1 min-h-0 sm:flex-none bg-black flex items-center justify-center">
+          {autoMuted && (
+            <button
+              onClick={unmute}
+              className="absolute top-3 left-3 z-10 inline-flex items-center gap-1.5 rounded-md bg-black/70 px-2.5 py-1.5 text-xs font-medium text-ink-100 ring-1 ring-white/20 hover:bg-black/85"
+            >
+              <VolumeX size={14} />
+              Tap for sound
+            </button>
+          )}
           <video
             ref={videoRef}
             src={url}
             controls
-            autoPlay
             playsInline
             onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
             // Re-engage the fast-forward timer on resume; drop it on pause so
@@ -239,6 +285,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
               // Browsers reset playbackRate when a new source loads; re-apply
               // the user's choice so it survives autoplay/metadata load.
               applyRate(rate);
+              void startPlayback();
             }}
             className="w-full h-full object-contain sm:h-auto sm:max-h-[70vh]"
           />

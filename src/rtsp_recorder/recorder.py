@@ -12,17 +12,28 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import Stream, StreamStatus
 
 logger = logging.getLogger(__name__)
 
-# Time we wait between restart attempts after ffmpeg exits with a failure.
-# Keep small so transient network blips recover quickly; an actually-broken
-# stream just keeps logging restart attempts, which is fine.
+# Delay before the first restart attempt after ffmpeg exits with a failure.
+# Small so transient network blips recover almost immediately.
 RESTART_BACKOFF_SECONDS = 5.0
+
+# Ceiling for the restart delay. Each consecutive failure doubles the wait up to
+# this cap, so a camera that is switched off overnight is polled about once a
+# minute instead of spawning an ffmpeg every 5s for hours, while a brief blip
+# still recovers at the base delay. The delay resets as soon as a segment is
+# written, so recovering costs at most this long.
+RESTART_BACKOFF_MAX_SECONDS = 60.0
+
+# How much of the stream to sample when checking that an advertised audio track
+# actually carries packets. Three seconds is several G.711 frames yet still
+# short enough to sit inside startup.
+AUDIO_PROBE_INTERVAL_SECONDS = 3
 
 # Socket I/O timeout (microseconds) handed to ffmpeg's RTSP demuxer via
 # `-timeout`. Without it the option defaults to 0 (infinite): when the network
@@ -90,9 +101,21 @@ class StreamRecorder:
         self._last_error: str | None = None
         self._restart_count: int = 0
         self._current_file: str | None = None
-        # Input video codec, probed once on first launch and cached. Drives the
-        # HEVC hvc1 tagging below; None until a probe succeeds.
+        # Input video codec, probed on launch and cached while the run is
+        # healthy. Drives the HEVC hvc1 tagging below; None until a probe
+        # succeeds.
         self._video_codec: str | None = None
+        # Input audio codec, or None when the source carries no usable audio.
+        # `_probed` distinguishes "no audio" from "not probed yet", since None
+        # is a legitimate result.
+        self._audio_codec: str | None = None
+        self._probed: bool = False
+        # Seconds to wait before the next restart, doubled on each consecutive
+        # failure and reset once recording succeeds.
+        self._backoff: float = RESTART_BACKOFF_SECONDS
+        # When the next reconnect attempt is due, surfaced so the UI can say how
+        # long until we look for the camera again.
+        self._next_retry_at: datetime | None = None
         # Once True, subsequent failures present as "reconnecting" rather than
         # "error" so the UI can distinguish never-worked from lost-connection.
         self._has_recorded: bool = False
@@ -142,6 +165,9 @@ class StreamRecorder:
             last_error=self._last_error,
             restart_count=self._restart_count,
             current_file=self._current_file,
+            has_audio=self._audio_codec is not None if self._probed else None,
+            audio_codec=self._audio_codec,
+            next_retry_at=self._next_retry_at,
         )
 
     # ---- internals ----
@@ -173,29 +199,44 @@ class StreamRecorder:
             self._state = "reconnecting" if self._has_recorded else "error"
             self._restart_count += 1
             first_attempt = False
+            # The camera may come back with a different shape than it had —
+            # audio switched on, a codec change — so re-probe rather than
+            # reusing what we learned before it went away.
+            self._probed = False
+            delay = self._backoff
+            self._backoff = min(self._backoff * 2, RESTART_BACKOFF_MAX_SECONDS)
+            self._next_retry_at = datetime.now(timezone.utc) + timedelta(
+                seconds=delay
+            )
             try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=RESTART_BACKOFF_SECONDS
-                )
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
                 break
             except asyncio.TimeoutError:
                 pass
 
         self._state = "stopped"
         self._current_file = None
+        self._next_retry_at = None
 
     async def _run_ffmpeg_once(self) -> int:
         pattern = str(self.dir / "%Y-%m-%d_%H-%M-%S.mp4")
         # Probe the input codec once (cached) so we know whether to tag the
         # output HEVC as hvc1 — see _ffmpeg_args. Best-effort: on failure we
         # record untagged and the faststart loop re-tags finalized segments.
-        if self._video_codec is None:
-            self._video_codec = await self._probe_video_codec()
-            if self._video_codec:
+        if not self._probed:
+            video, audio = await self._probe_streams()
+            # Keep whatever the last successful probe told us if this one
+            # failed outright, so a momentarily unreachable camera doesn't lose
+            # its hvc1 tagging.
+            if video is not None:
+                self._video_codec = video
+                self._audio_codec = audio
+                self._probed = True
                 logger.info(
-                    "recorder %s: input video codec=%s",
+                    "recorder %s: input video=%s audio=%s",
                     self.stream.name,
-                    self._video_codec,
+                    video,
+                    audio or "none",
                 )
         args = self._ffmpeg_args(pattern)
         env = {**os.environ, "TZ": self.tz}
@@ -366,13 +407,82 @@ class StreamRecorder:
         except Exception:  # pragma: no cover - defensive
             pass
 
-    async def _probe_video_codec(self) -> str | None:
-        """Return the input's video codec name (e.g. "hevc", "h264"), or None.
+    async def _probe_streams(self) -> tuple[str | None, str | None]:
+        """Return ``(video_codec, audio_codec)`` for the input.
 
-        Runs a short, sequential ffprobe before the recording ffmpeg starts —
-        no second concurrent RTSP connection. Bounded by the socket timeout and
-        a hard wall-clock cap so an unreachable camera can't stall startup.
+        ``video_codec`` is None when the probe failed outright (unreachable
+        camera), which callers treat as "learned nothing". ``audio_codec`` is
+        None when the source has no audio *or* advertises one that never
+        delivers packets — see ``_audio_carries_packets``.
+
+        Runs sequentially before the recording ffmpeg starts, so we never hold
+        two RTSP connections at once. Bounded by the socket timeout and a hard
+        wall-clock cap so an unreachable camera can't stall startup.
         """
+        out = await self._run_ffprobe(
+            [
+                "-show_entries",
+                "stream=codec_type,codec_name",
+                "-of",
+                "compact=p=0:nk=0",
+            ],
+            PROBE_TIMEOUT_SECONDS,
+        )
+        if out is None:
+            return None, None
+
+        video: str | None = None
+        audio: str | None = None
+        for line in out.splitlines():
+            fields = dict(
+                part.split("=", 1) for part in line.strip().split("|") if "=" in part
+            )
+            kind, name = fields.get("codec_type"), fields.get("codec_name")
+            if not name:
+                continue
+            if kind == "video" and video is None:
+                video = name
+            elif kind == "audio" and audio is None:
+                audio = name
+        if video is None:
+            # A source with no video stream is not something we record.
+            return None, None
+        if audio and not await self._audio_carries_packets():
+            logger.warning(
+                "recorder %s: source advertises %s audio but sent no packets; "
+                "recording video only",
+                self.stream.name,
+                audio,
+            )
+            audio = None
+        return video, audio
+
+    async def _audio_carries_packets(self) -> bool:
+        """True if the advertised audio track actually delivers packets.
+
+        A source can announce audio in its SDP and then never send any — for
+        instance a bridge whose upstream audio died after the RTSP session was
+        negotiated. Recording that phantom track is worse than skipping it: the
+        segment muxer waits on a stream that never advances, so rotation stalls
+        and one short file is left behind instead of a series.
+        """
+        out = await self._run_ffprobe(
+            [
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "packet=size",
+                "-of",
+                "csv=p=0",
+                "-read_intervals",
+                f"%+{AUDIO_PROBE_INTERVAL_SECONDS}",
+            ],
+            PROBE_TIMEOUT_SECONDS,
+        )
+        return bool(out and out.strip())
+
+    async def _run_ffprobe(self, extra: list[str], timeout: float) -> str | None:
+        """Run ffprobe against the stream, returning stdout or None on failure."""
         args = [
             "ffprobe",
             "-v",
@@ -381,12 +491,7 @@ class StreamRecorder:
             "tcp",
             "-timeout",
             str(FFMPEG_SOCKET_TIMEOUT_US),
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            *extra,
             self.stream.url,
         ]
         try:
@@ -400,11 +505,9 @@ class StreamRecorder:
             logger.warning("recorder %s: ffprobe failed to launch: %s", self.stream.name, e)
             return None
         try:
-            out, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=PROBE_TIMEOUT_SECONDS
-            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            logger.warning("recorder %s: codec probe timed out", self.stream.name)
+            logger.warning("recorder %s: probe timed out", self.stream.name)
             try:
                 proc.kill()
                 await proc.wait()
@@ -413,8 +516,28 @@ class StreamRecorder:
             return None
         if proc.returncode != 0:
             return None
-        codec = out.decode(errors="replace").strip().splitlines()
-        return codec[0].strip() if codec and codec[0].strip() else None
+        return out.decode(errors="replace")
+
+    # Audio codecs MP4 can carry as-is. Everything else is transcoded to AAC:
+    # the G.711 variants most IP cameras emit have no MP4 mapping at all
+    # (ffmpeg refuses to write the header), and while Opus is technically
+    # storable, Safari won't decode it from MP4. Transcoding 8 kHz mono is
+    # cheap enough not to matter next to the video copy.
+    _MP4_NATIVE_AUDIO = frozenset({"aac"})
+
+    def _audio_args(self) -> list[str]:
+        """Stream selection and audio codec for the recording ffmpeg."""
+        if not self._audio_codec:
+            return ["-an"]
+        codec = (
+            ["-c:a", "copy"]
+            if self._audio_codec in self._MP4_NATIVE_AUDIO
+            else ["-c:a", "aac"]
+        )
+        # Map explicitly so the audio track is always output stream 1; the
+        # segment muxer cuts on the reference stream and we want that to stay
+        # video.
+        return ["-map", "0:v:0", "-map", "0:a:0", *codec]
 
     def _ffmpeg_args(self, pattern: str) -> list[str]:
         return [
@@ -437,9 +560,9 @@ class StreamRecorder:
             str(FFMPEG_SOCKET_TIMEOUT_US),
             "-i",
             self.stream.url,
-            "-c",
+            *self._audio_args(),
+            "-c:v",
             "copy",
-            "-an",  # no audio for now; many RTSP cameras have problematic audio
             # Apple decoders (Safari/iOS) only play HEVC tagged hvc1, not the
             # hev1 ffmpeg emits by default. Tag it here so even the live
             # in-progress segment is iPhone-playable. HEVC-only — tagging an
@@ -516,6 +639,10 @@ class StreamRecorder:
                 self._has_recorded = True
                 self._last_error = None
                 self._last_rotation_wall = time.time()
+                # A segment is proof the camera is back, so the next outage
+                # starts retrying from the short delay again.
+                self._backoff = RESTART_BACKOFF_SECONDS
+                self._next_retry_at = None
             elif level in ("fatal", "error"):
                 self._last_error = body
             logger.debug("ffmpeg[%s][%s]: %s", self.stream.name, level, body)

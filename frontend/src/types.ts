@@ -20,6 +20,13 @@ export interface StreamStatus {
   last_error: string | null;
   restart_count: number;
   current_file: string | null;
+  // Whether the source carries usable audio, as of the last probe. Null when
+  // the stream has never been probed successfully.
+  has_audio: boolean | null;
+  // Input audio codec, e.g. "pcm_alaw". Recorded as AAC unless MP4 can carry it.
+  audio_codec: string | null;
+  // When the next reconnect attempt is due, while the camera is unreachable.
+  next_retry_at: string | null;
 }
 
 export interface ServiceStatus {
