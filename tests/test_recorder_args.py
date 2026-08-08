@@ -48,12 +48,31 @@ def _segment(args: list[str]) -> list[str]:
 
 
 class AudioArgsTest(unittest.TestCase):
-    def _args(self, video: str | None, audio: str | None) -> list[str]:
+    def _args(
+        self, video: str | None, audio: str | None, rate: int | None = 8000
+    ) -> list[str]:
         rec = _make_recorder()
         rec._video_codec = video
         rec._audio_codec = audio
+        rec._audio_rate = rate
         rec._probed = True
         return _segment(rec._ffmpeg_args("out_%03d.mp4"))
+
+    def test_low_rate_audio_is_resampled_for_aac(self) -> None:
+        # 8 kHz AAC is decoded inconsistently; some players treat it as dual-rate
+        # SBR and play it at half speed, which sounds slowed down
+        args = self._args("hevc", "pcm_alaw", 8000)
+        self.assertEqual(args[args.index("-ar") + 1], "16000")
+
+    def test_adequate_rates_are_left_alone(self) -> None:
+        for rate in (16000, 44100, 48000):
+            self.assertNotIn("-ar", self._args("hevc", "pcm_alaw", rate))
+
+    def test_unknown_rate_is_not_resampled(self) -> None:
+        self.assertNotIn("-ar", self._args("hevc", "pcm_alaw", None))
+
+    def test_copied_audio_is_never_resampled(self) -> None:
+        self.assertNotIn("-ar", self._args("hevc", "aac", 8000))
 
     def test_no_audio_disables_it(self) -> None:
         args = self._args("hevc", None)

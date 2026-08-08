@@ -28,3 +28,6 @@ src/rtsp_recorder/static/index.html
 .vscode/
 .idea/
 .DS_Store
+
+# local agent skills/config (not shared)
+.claude/

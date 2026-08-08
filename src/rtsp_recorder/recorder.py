@@ -109,6 +109,9 @@ class StreamRecorder:
         # `_probed` distinguishes "no audio" from "not probed yet", since None
         # is a legitimate result.
         self._audio_codec: str | None = None
+        # Input audio sample rate in Hz, used to decide whether to resample on
+        # the way into AAC. None when unknown or there is no audio.
+        self._audio_rate: int | None = None
         self._probed: bool = False
         # Seconds to wait before the next restart, doubled on each consecutive
         # failure and reset once recording succeeds.
@@ -422,7 +425,7 @@ class StreamRecorder:
         out = await self._run_ffprobe(
             [
                 "-show_entries",
-                "stream=codec_type,codec_name",
+                "stream=codec_type,codec_name,sample_rate",
                 "-of",
                 "compact=p=0:nk=0",
             ],
@@ -433,6 +436,7 @@ class StreamRecorder:
 
         video: str | None = None
         audio: str | None = None
+        self._audio_rate = None
         for line in out.splitlines():
             fields = dict(
                 part.split("=", 1) for part in line.strip().split("|") if "=" in part
@@ -444,6 +448,8 @@ class StreamRecorder:
                 video = name
             elif kind == "audio" and audio is None:
                 audio = name
+                rate = fields.get("sample_rate", "")
+                self._audio_rate = int(rate) if rate.isdigit() else None
         if video is None:
             # A source with no video stream is not something we record.
             return None, None
@@ -525,15 +531,23 @@ class StreamRecorder:
     # cheap enough not to matter next to the video copy.
     _MP4_NATIVE_AUDIO = frozenset({"aac"})
 
+    # Lowest rate we will write AAC at. Cameras commonly send 8 kHz G.711, and
+    # AAC that low is decoded inconsistently — some players apply dual-rate SBR
+    # and play it at half speed, which sounds slowed down and stretched even
+    # though the file itself is correct. Resampling up costs almost nothing and
+    # keeps every decoder on well-trodden ground.
+    _MIN_AAC_SAMPLE_RATE = 16000
+
     def _audio_args(self) -> list[str]:
         """Stream selection and audio codec for the recording ffmpeg."""
         if not self._audio_codec:
             return ["-an"]
-        codec = (
-            ["-c:a", "copy"]
-            if self._audio_codec in self._MP4_NATIVE_AUDIO
-            else ["-c:a", "aac"]
-        )
+        if self._audio_codec in self._MP4_NATIVE_AUDIO:
+            codec = ["-c:a", "copy"]
+        else:
+            codec = ["-c:a", "aac"]
+            if self._audio_rate and self._audio_rate < self._MIN_AAC_SAMPLE_RATE:
+                codec += ["-ar", str(self._MIN_AAC_SAMPLE_RATE)]
         # Map explicitly so the audio track is always output stream 1; the
         # segment muxer cuts on the reference stream and we want that to stay
         # video.
