@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import {
   Activity,
   AlertTriangle,
@@ -20,6 +26,7 @@ import { api } from "../api";
 import { StatusDot, StateLabel } from "./StatusDot";
 import { useToast } from "./Toast";
 import { VideoPlayerModal } from "./VideoPlayerModal";
+import { decodePeaks, MiniWaveform } from "./Waveform";
 
 interface Props {
   stream: StreamStatus;
@@ -32,6 +39,9 @@ const FILE_POLL_MS = 5000;
 // the in-row progress % visibly ticks. Without this, a file that
 // finishes in <5s would never display its analyzing state.
 const FILE_POLL_MS_ACTIVE = 1500;
+// Waveforms only change when the analyzer finishes a segment, so refetching
+// them at the file-poll rate would be pure waste.
+const WAVEFORM_REFETCH_MS = 30000;
 
 export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
   const toast = useToast();
@@ -43,6 +53,8 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
   const [confirmDeleteFile, setConfirmDeleteFile] =
     useState<RecordingFile | null>(null);
   const [deletingFile, setDeletingFile] = useState(false);
+  const [waveforms, setWaveforms] = useState<Record<string, string | null>>({});
+  const waveformsFetchedAt = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -75,6 +87,44 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
       if (timer) window.clearTimeout(timer);
     };
   }, [stream.name, toast]);
+
+  useEffect(() => {
+    setWaveforms({});
+    waveformsFetchedAt.current = 0;
+  }, [stream.name]);
+
+  // Fetch only when the list holds a recording we have no waveform for, and no
+  // more often than the analyzer could plausibly have produced a new one.
+  useEffect(() => {
+    if (!files) return;
+    const missing = files.some(
+      (f) => f.name !== stream.current_file && !(f.name in waveforms),
+    );
+    if (!missing) return;
+    const now = Date.now();
+    if (now - waveformsFetchedAt.current < WAVEFORM_REFETCH_MS) return;
+    waveformsFetchedAt.current = now;
+    let active = true;
+    api
+      .waveforms(stream.name)
+      .then((w) => {
+        if (active) setWaveforms(w);
+      })
+      .catch(() => {
+        // Waveforms are decoration; a failure must not disturb the list.
+      });
+    return () => {
+      active = false;
+    };
+  }, [files, waveforms, stream.name, stream.current_file]);
+
+  const peaksByFile = useMemo(() => {
+    const m = new Map<string, Uint8Array>();
+    for (const [name, encoded] of Object.entries(waveforms)) {
+      if (encoded) m.set(name, decodePeaks(encoded));
+    }
+    return m;
+  }, [waveforms]);
 
   async function toggleEnabled() {
     setBusy(true);
@@ -294,6 +344,9 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider">
                     Recording
                   </th>
+                  <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-32 hidden lg:table-cell">
+                    Audio
+                  </th>
                   <th className="px-4 py-2.5 text-xs font-medium text-ink-400 uppercase tracking-wider w-24">
                     Duration
                   </th>
@@ -344,6 +397,16 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                             </div>
                           </div>
                         </div>
+                      </td>
+                      <td className="px-4 py-2.5 hidden lg:table-cell">
+                        {peaksByFile.has(f.name) ? (
+                          <MiniWaveform
+                            peaks={peaksByFile.get(f.name)!}
+                            className="text-ink-300"
+                          />
+                        ) : (
+                          <span className="text-ink-600">—</span>
+                        )}
                       </td>
                       <td className="px-4 py-2.5 text-ink-300 tabular-nums">
                         {live ? (
@@ -459,6 +522,12 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                         <span className="text-ink-500">·</span>
                         <span className="tabular-nums">{formatBytes(f.size)}</span>
                       </div>
+                      {peaksByFile.has(f.name) && (
+                        <MiniWaveform
+                          peaks={peaksByFile.get(f.name)!}
+                          className="mt-1.5 text-ink-400"
+                        />
+                      )}
                     </div>
                     <RecordingMenu
                       downloadUrl={api.fileUrl(stream.name, f.name)}

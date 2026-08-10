@@ -106,7 +106,7 @@ async def analyze(
     # Probe duration first so the decode-progress callback has a
     # denominator. Probe is ~50 ms — well below decode time — and the
     # tiny loss in parallelism is worth getting accurate progress.
-    duration = await _probe_duration(path)
+    duration = await probe_duration(path)
 
     def decoder_progress(out_time_seconds: float) -> None:
         if on_progress is None or duration is None or duration <= 0:
@@ -150,7 +150,7 @@ def _classify(frames: np.ndarray, motion_threshold: float) -> bool:
     return stat < motion_threshold
 
 
-async def _probe_duration(path: Path) -> float | None:
+async def probe_duration(path: Path) -> float | None:
     """Return the container's reported duration in seconds, or None."""
     args = [
         "ffprobe",

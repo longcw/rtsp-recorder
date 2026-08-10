@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import faststart, idle_index
+from . import audio_index, audio_peaks, faststart, idle_index
 from .config import ConfigStore
 from .idle_detector import analyze
 from .models import Config, Stream, ServiceStatus
@@ -157,6 +157,9 @@ class RecorderManager:
             data = idle_index.load(target_dir)
             if data.pop(filename, None) is not None:
                 idle_index.save(target_dir, data)
+            peaks = audio_index.load(target_dir)
+            if peaks.pop(filename, None) is not None:
+                audio_index.save(target_dir, peaks)
 
         await asyncio.to_thread(_delete)
 
@@ -382,6 +385,12 @@ class RecorderManager:
                 await self._analyze_pending()
             except Exception:
                 logger.exception("analyzer: tick failed")
+            # Separate guard so a motion-detector failure doesn't also stall
+            # the waveforms, and vice versa.
+            try:
+                await self._peaks_pending()
+            except Exception:
+                logger.exception("audio-peaks: tick failed")
 
             self._analyze_wake.clear()
             # Wake early on a rescan request, otherwise tick on the regular
@@ -471,6 +480,46 @@ class RecorderManager:
                     result.duration_seconds,
                 )
 
+    async def _peaks_pending(self) -> None:
+        """Extract audio waveforms for settled segments that lack one.
+
+        Keyed off the audio index alone, so recordings made before this index
+        existed get backfilled without a rescan. Skips the live segment and
+        anything whose mtime is still moving, same as the analyzer.
+        """
+        if not self.recordings_dir.exists():
+            return
+        live = {
+            r.status().current_file
+            for r in self._recorders.values()
+            if r.status().current_file
+        }
+        now = time.time()
+        for stream_dir in self.recordings_dir.iterdir():
+            if not stream_dir.is_dir():
+                continue
+            index = await asyncio.to_thread(audio_index.load, stream_dir)
+            for f in sorted(stream_dir.iterdir()):
+                if self._analyze_stop.is_set():
+                    return
+                if not f.is_file() or not f.name.endswith(".mp4"):
+                    continue
+                if f.name in index or f.name in live:
+                    continue
+                try:
+                    st = f.stat()
+                except FileNotFoundError:
+                    continue
+                if now - st.st_mtime < ANALYZE_MIN_AGE_SECONDS:
+                    continue
+                result = await audio_peaks.analyze_audio(f)
+                await asyncio.to_thread(
+                    audio_index.set_peaks,
+                    stream_dir,
+                    f.name,
+                    peaks=audio_peaks.encode(result.peaks) if result.peaks else None,
+                    duration=result.duration_seconds,
+                )
 
     # ---- faststart loop ----
 
@@ -575,8 +624,8 @@ def prune_old_files(
         for f in stream_dir.iterdir():
             if not f.is_file():
                 continue
-            # Don't try to prune the index file itself.
-            if f.name == idle_index.INDEX_FILENAME:
+            # Don't try to prune the index files themselves.
+            if f.name in (idle_index.INDEX_FILENAME, audio_index.INDEX_FILENAME):
                 continue
             try:
                 mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
@@ -597,4 +646,5 @@ def prune_old_files(
                 present.add(f.name)
         # Drop index entries for files we just removed (or that vanished).
         idle_index.drop_missing(stream_dir, present)
+        audio_index.drop_missing(stream_dir, present)
     return removed

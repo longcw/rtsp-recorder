@@ -1,4 +1,10 @@
-import type { Config, RecordingFile, ServiceStatus, Stream } from "./types";
+import type {
+  Config,
+  RecordingFile,
+  ServiceStatus,
+  Stream,
+  Waveform,
+} from "./types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -52,6 +58,19 @@ export const api = {
 
   fileUrl: (stream: string, file: string) =>
     `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}`,
+
+  waveform: (stream: string, file: string) =>
+    fetch(
+      `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}/waveform`,
+    ).then(json<Waveform>),
+
+  // Thumbnail-resolution peaks for every analyzed file in the stream, keyed by
+  // filename. Deliberately not part of listFiles, which is polled every few
+  // seconds and already returns every recording.
+  waveforms: (stream: string) =>
+    fetch(`/api/streams/${encodeURIComponent(stream)}/waveforms`).then(
+      json<Record<string, string | null>>,
+    ),
 
   clipFile: async (
     stream: string,

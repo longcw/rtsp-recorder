@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from . import idle_index
+from . import audio_index, audio_peaks, idle_index
 from .config import ConfigStore
 from .manager import RecorderManager
 from .models import (
@@ -78,6 +78,10 @@ _SEGMENT_NAME_FMT = "%Y-%m-%d_%H-%M-%S"
 # multipart/byteranges would require a substantially more involved encoder.
 _RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$")
 _RANGE_CHUNK = 64 * 1024
+
+# Bars in the per-recording waveform thumbnails. Enough to read at thumbnail
+# width, small enough that one response can carry every file in a stream.
+_LIST_WAVEFORM_BUCKETS = 48
 
 
 def _range_not_satisfiable(file_size: int) -> StreamingResponse:
@@ -204,7 +208,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         for f in target.iterdir():
             if not f.is_file():
                 continue
-            if f.name == idle_index.INDEX_FILENAME:
+            if f.name in (idle_index.INDEX_FILENAME, audio_index.INDEX_FILENAME):
                 continue
             try:
                 st = f.stat()
@@ -246,6 +250,44 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             )
         files.sort(key=lambda r: r.name, reverse=True)
         return files
+
+    @app.get("/api/streams/{name}/waveforms", response_model=dict)
+    async def list_waveforms(name: str) -> dict:
+        """Thumbnail-resolution waveform for every analyzed file in a stream.
+
+        Kept off `/files` on purpose: that response carries every recording and
+        the UI re-polls it every few seconds, while these change only when the
+        analyzer finishes a new segment.
+        """
+        target = _resolve_stream_dir(name)
+        data = await asyncio.to_thread(audio_index.load, target)
+        out: dict[str, str | None] = {}
+        for filename, entry in data.items():
+            peaks = entry.get("peaks") if isinstance(entry, dict) else None
+            out[filename] = (
+                audio_peaks.downsample(peaks, _LIST_WAVEFORM_BUCKETS)
+                if isinstance(peaks, str)
+                else None
+            )
+        return out
+
+    @app.get("/api/streams/{name}/files/{filename}/waveform", response_model=dict)
+    async def file_waveform(name: str, filename: str) -> dict:
+        if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
+            raise HTTPException(status_code=400, detail="invalid filename")
+        target = _resolve_stream_dir(name)
+        entry = (await asyncio.to_thread(audio_index.load, target)).get(filename)
+        if not isinstance(entry, dict):
+            # Not looked at yet — the analyzer skips the live segment and
+            # anything still settling, so the UI should ask again later.
+            return {"peaks": None, "duration": None, "pending": True}
+        peaks = entry.get("peaks")
+        duration = entry.get("duration")
+        return {
+            "peaks": peaks if isinstance(peaks, str) else None,
+            "duration": float(duration) if isinstance(duration, (int, float)) else None,
+            "pending": False,
+        }
 
     @app.post("/api/streams/{name}/files/{filename}/reanalyze", response_model=dict)
     async def reanalyze_file(name: str, filename: str) -> dict:

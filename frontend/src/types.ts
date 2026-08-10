@@ -58,6 +58,16 @@ export interface RecordingFile {
   analyze_progress: number | null;
 }
 
+export interface Waveform {
+  // Base64 peak levels, one byte per bucket. Null when the recording carries
+  // no audio track.
+  peaks: string | null;
+  // Seconds the peaks span. Null when the duration probe failed.
+  duration: number | null;
+  // True while the analyzer has not reached this recording yet.
+  pending: boolean;
+}
+
 export interface Config {
   streams: Stream[];
   retention_days: number;

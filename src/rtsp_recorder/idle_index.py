@@ -16,12 +16,11 @@ gone; the analyzer never re-runs once an entry exists.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-import tempfile
 import threading
 from pathlib import Path
+
+from . import json_sidecar
 
 logger = logging.getLogger(__name__)
 
@@ -34,40 +33,11 @@ def index_path(stream_dir: Path) -> Path:
 
 
 def load(stream_dir: Path) -> dict[str, dict]:
-    path = index_path(stream_dir)
-    try:
-        text = path.read_text()
-    except FileNotFoundError:
-        return {}
-    except OSError as e:
-        logger.warning("idle-index: read %s failed: %s", path, e)
-        return {}
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.warning("idle-index: invalid json at %s: %s", path, e)
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return data
+    return json_sidecar.load(index_path(stream_dir))
 
 
 def save(stream_dir: Path, data: dict[str, dict]) -> None:
-    path = index_path(stream_dir)
-    stream_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".idle-", suffix=".json", dir=str(stream_dir))
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
+    json_sidecar.save(index_path(stream_dir), data)
 
 
 def get_idle(stream_dir: Path, filename: str) -> bool | None:

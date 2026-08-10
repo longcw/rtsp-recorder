@@ -1,8 +1,17 @@
-import { useEffect, useRef, useState } from "react";
-import { Download, Gauge, Loader2, Scissors, VolumeX, X } from "lucide-react";
-import type { RecordingFile } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  AudioLines,
+  Download,
+  Gauge,
+  Loader2,
+  Scissors,
+  VolumeX,
+  X,
+} from "lucide-react";
+import type { RecordingFile, Waveform } from "../types";
 import { api } from "../api";
 import { useToast } from "./Toast";
+import { decodePeaks, WaveformStrip } from "./Waveform";
 
 interface Props {
   streamName: string;
@@ -291,6 +300,15 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
           />
         </div>
 
+        <AudioTimeline
+          streamName={streamName}
+          file={file.name}
+          live={live}
+          duration={duration}
+          currentTime={currentTime}
+          onSeek={seekTo}
+        />
+
         <SpeedBar rate={rate} onChange={changeRate} />
 
         <TrimBar
@@ -311,6 +329,102 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
         />
       </div>
     </div>
+  );
+}
+
+// How long to wait before asking again for a waveform the analyzer has not
+// produced yet. It runs on a 30 s cadence, so this catches up within a tick.
+const WAVEFORM_RETRY_MS = 10000;
+
+function AudioTimeline({
+  streamName,
+  file,
+  live,
+  duration,
+  currentTime,
+  onSeek,
+}: {
+  streamName: string;
+  file: string;
+  live: boolean;
+  duration: number | null;
+  currentTime: number;
+  onSeek: (seconds: number) => void;
+}) {
+  const [wave, setWave] = useState<Waveform | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    // The live segment is still growing, so any waveform we drew would be
+    // both partial and wrong about where the end is.
+    if (live) return;
+    let active = true;
+    let timer: number | undefined;
+    async function load() {
+      try {
+        const w = await api.waveform(streamName, file);
+        if (!active) return;
+        setWave(w);
+        if (w.pending) timer = window.setTimeout(load, WAVEFORM_RETRY_MS);
+      } catch {
+        if (active) setFailed(true);
+      }
+    }
+    void load();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [streamName, file, live]);
+
+  const peaks = useMemo(
+    () => (wave?.peaks ? decodePeaks(wave.peaks) : null),
+    [wave?.peaks],
+  );
+
+  // Lay the peaks out against whichever length is longer, so a segment whose
+  // video runs past its last audio packet still ends where the video ends.
+  const span = Math.max(duration ?? 0, wave?.duration ?? 0);
+
+  let body;
+  if (live) {
+    body = <Note>Available once this segment finishes recording.</Note>;
+  } else if (failed) {
+    body = <Note>Waveform unavailable.</Note>;
+  } else if (wave === null) {
+    body = <Note>Loading…</Note>;
+  } else if (wave.pending) {
+    body = <Note>Waveform is still being generated…</Note>;
+  } else if (peaks === null || span <= 0) {
+    body = <Note>This recording has no audio.</Note>;
+  } else {
+    body = (
+      <WaveformStrip
+        peaks={peaks}
+        peaksDuration={wave.duration ?? span}
+        duration={span}
+        currentTime={currentTime}
+        onSeek={onSeek}
+      />
+    );
+  }
+
+  return (
+    <div className="border-t border-white/[0.06] px-4 py-2">
+      <div className="flex items-center gap-2 mb-1">
+        <AudioLines size={14} className="text-ink-300 shrink-0" />
+        <span className="text-[11px] uppercase tracking-wider text-ink-500">
+          Audio
+        </span>
+      </div>
+      {body}
+    </div>
+  );
+}
+
+function Note({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="h-11 flex items-center text-xs text-ink-500">{children}</div>
   );
 }
 
