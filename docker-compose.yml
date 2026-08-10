@@ -3,10 +3,11 @@ services:
     build: .
     image: rtsp-recorder:latest
     container_name: rtsp-recorder
-    restart: unless-stopped
+    # host-specific values come from a gitignored .env beside this file
+    restart: ${RTSP_RESTART:-unless-stopped}
     ports:
-      - "8765:8765"
+      - "${RTSP_HOST_PORT:-8765}:8765"
     volumes:
-      - ./data:/data
+      - ${RTSP_DATA_DIR:-./data}:/data
     environment:
       - RTSP_RECORDER_DATA_DIR=/data

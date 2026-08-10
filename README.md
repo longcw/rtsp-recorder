@@ -24,6 +24,16 @@ docker compose up --build -d
 Open <http://localhost:8765>. Recordings land in `./data/recordings/<stream>/`
 on the host; the config (streams + retention) lives in `./data/config.json`.
 
+To give one host different values, put them in a `.env` file next to
+`docker-compose.yml`. That file is gitignored, so a deployed checkout stays
+clean and pulls without conflicts:
+
+```sh
+RTSP_HOST_PORT=8079
+RTSP_DATA_DIR=/srv/nvr/rtsp-recorder
+RTSP_RESTART=always
+```
+
 ## Local development
 
 Backend (FastAPI + recorder loop):
