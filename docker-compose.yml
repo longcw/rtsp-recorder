@@ -5,9 +5,14 @@ services:
     container_name: rtsp-recorder
     # host-specific values come from a gitignored .env beside this file
     restart: ${RTSP_RESTART:-unless-stopped}
+    # set to nvidia (with nvidia-container-toolkit installed) to export
+    # sped-up clips on the GPU instead of the CPU
+    runtime: ${RTSP_DOCKER_RUNTIME:-runc}
     ports:
       - "${RTSP_HOST_PORT:-8765}:8765"
     volumes:
       - ${RTSP_DATA_DIR:-./data}:/data
     environment:
       - RTSP_RECORDER_DATA_DIR=/data
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility

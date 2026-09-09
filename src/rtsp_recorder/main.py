@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +16,6 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from starlette.background import BackgroundTask
 
 from . import audio_index, audio_peaks, idle_index
 from .config import ConfigStore
@@ -78,6 +76,7 @@ _SEGMENT_NAME_FMT = "%Y-%m-%d_%H-%M-%S"
 # multipart/byteranges would require a substantially more involved encoder.
 _RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$")
 _RANGE_CHUNK = 64 * 1024
+_CLIP_CHUNK = 256 * 1024
 
 # Bars in the per-recording waveform thumbnails. Enough to read at thumbnail
 # width, small enough that one response can carry every file in a stream.
@@ -449,79 +448,95 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if not target.is_file():
             raise HTTPException(status_code=404, detail="not found")
 
-        # Write into a per-clip tempfile and stream it back, then delete via
-        # the background task. We can't pipe ffmpeg straight to the response
-        # because MP4 needs the moov atom, which non-fragmented output writes
-        # at the end after seeking the file.
+        # Stream fragmented MP4 straight from ffmpeg's stdout. A plain MP4
+        # needs its moov atom written last, which would mean buffering the
+        # whole clip before answering; a sped-up clip re-encodes at only a
+        # few times realtime, and a reverse proxy in front of us gives up on
+        # a request that stays silent that long. Fragments start flowing
+        # within a second instead.
         stem = filename.rsplit(".", 1)[0]
         speed_tag = "" if speed <= 1.0 else f"_{speed:g}x"
-        suffix = f"_clip_{int(round(start))}-{int(round(end))}{speed_tag}.mp4"
-        out_fd, out_path_str = tempfile.mkstemp(prefix=f"{stem}", suffix=suffix)
-        os.close(out_fd)
-        out_path = Path(out_path_str)
-
+        download_name = (
+            f"{stem}_clip_{int(round(start))}-{int(round(end))}{speed_tag}.mp4"
+        )
+        base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+        trim = ["-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(target)]
+        out = ["-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
         if speed <= 1.0:
-            codec_args = [
-                "-c", "copy",
-                "-avoid_negative_ts", "make_zero",
+            attempts = [
+                [*base, *trim, "-c", "copy", "-avoid_negative_ts", "make_zero", *out]
             ]
         else:
             # Speeding up needs new timestamps, which means a re-encode. Drop
             # audio (useless at Nx) and cap the output at 30fps so high speeds
-            # decimate frames instead of encoding every source frame.
-            codec_args = [
-                "-vf", f"setpts=PTS/{speed:g},fps=30",
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
+            # decimate frames instead of encoding every source frame. Every
+            # source frame still has to be decoded, and that dominates, so
+            # try NVDEC + NVENC first and fall back to the CPU when there is
+            # no usable card. Keyframes every 2s of output keep the fragments
+            # short.
+            speedup = ["-vf", f"setpts=PTS/{speed:g},fps=30", "-an", "-g", "60"]
+            attempts = [
+                [
+                    *base, "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+                    *trim, *speedup,
+                    "-c:v", "h264_nvenc", "-preset", "p4",
+                    "-rc", "vbr", "-cq", "27", "-b:v", "0",
+                    *out,
+                ],
+                [
+                    *base, *trim, *speedup,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    *out,
+                ],
             ]
 
-        args = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-nostdin",
-            "-y",
-            "-ss", f"{start:.3f}",
-            "-to", f"{end:.3f}",
-            "-i", str(target),
-            *codec_args,
-            "-movflags", "+faststart",
-            str(out_path),
-        ]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            out_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=500, detail="ffmpeg not available")
-
-        _, err = await proc.communicate()
-        if proc.returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
-            out_path.unlink(missing_ok=True)
-            tail = err.decode(errors="replace").strip().splitlines()[-1:]
+        # Wait for the first bytes before committing to a 200: anything that
+        # fails at setup (no GPU, bad codec, unreadable file) exits with no
+        # output, and that is when we can still fall back or report an error.
+        for i, args in enumerate(attempts):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except FileNotFoundError:
+                raise HTTPException(status_code=500, detail="ffmpeg not available")
+            err_task = asyncio.create_task(proc.stderr.read())
+            first = await proc.stdout.read(_CLIP_CHUNK)
+            if first:
+                break
+            await proc.wait()
+            tail = (await err_task).decode(errors="replace").strip().splitlines()[-1:]
             detail = tail[0] if tail else "ffmpeg failed"
+            if i + 1 < len(attempts):
+                logger.info("clip %s: GPU path unavailable (%s), using CPU", download_name, detail)
+                continue
             raise HTTPException(status_code=500, detail=f"clip failed: {detail}")
 
-        download_name = f"{stem}{suffix}"
-
-        def _cleanup() -> None:
+        async def stream() -> AsyncIterator[bytes]:
             try:
-                out_path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("failed to delete clip tempfile %s", out_path)
+                yield first
+                while chunk := await proc.stdout.read(_CLIP_CHUNK):
+                    yield chunk
+                await proc.wait()
+                if proc.returncode != 0:
+                    tail = (await err_task).decode(errors="replace").strip().splitlines()[-1:]
+                    logger.warning(
+                        "clip %s: ffmpeg exited %d: %s",
+                        download_name, proc.returncode, tail[0] if tail else "",
+                    )
+            finally:
+                # the client went away mid-clip; don't keep encoding for nobody
+                if proc.returncode is None:
+                    proc.kill()
 
-        return FileResponse(
-            out_path,
+        return StreamingResponse(
+            stream(),
             media_type="video/mp4",
-            filename=download_name,
-            background=BackgroundTask(_cleanup),
+            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
         )
 
     # ---- retention / config ----

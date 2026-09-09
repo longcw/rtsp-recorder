@@ -32,7 +32,10 @@ clean and pulls without conflicts:
 RTSP_HOST_PORT=8079
 RTSP_DATA_DIR=/srv/nvr/rtsp-recorder
 RTSP_RESTART=always
+RTSP_DOCKER_RUNTIME=nvidia
 ```
+
+`RTSP_DOCKER_RUNTIME=nvidia` needs the NVIDIA container toolkit on the host. With it, exporting a sped-up clip decodes and encodes on the GPU; without it (or on any other host) the export falls back to the CPU automatically.
 
 ## Local development
 
