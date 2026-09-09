@@ -77,3 +77,11 @@ export interface Config {
   timezone: string;
   running: boolean;
 }
+
+export interface ClipJob {
+  id: string;
+  state: "running" | "done" | "error" | "cancelled";
+  progress: number;
+  error: string | null;
+  download_name: string;
+}

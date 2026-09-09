@@ -1,4 +1,5 @@
 import type {
+  ClipJob,
   Config,
   RecordingFile,
   ServiceStatus,
@@ -72,36 +73,28 @@ export const api = {
       json<Record<string, string | null>>,
     ),
 
-  clipFile: async (
+  startClip: (
     stream: string,
     file: string,
     startSeconds: number,
     endSeconds: number,
     speed: number = 1,
-  ): Promise<{ blob: Blob; filename: string }> => {
-    const url =
+  ) =>
+    fetch(
       `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}/clip` +
-      `?start=${encodeURIComponent(startSeconds.toFixed(3))}` +
-      `&end=${encodeURIComponent(endSeconds.toFixed(3))}` +
-      (speed > 1 ? `&speed=${encodeURIComponent(speed)}` : "");
-    const res = await fetch(url);
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      let detail = text;
-      try {
-        const body = JSON.parse(text);
-        detail = body?.detail ?? text;
-      } catch {
-        // not JSON
-      }
-      throw new Error(detail || `${res.status} ${res.statusText}`);
-    }
-    const disp = res.headers.get("content-disposition") ?? "";
-    const m = disp.match(/filename="([^"]+)"/);
-    const filename = m?.[1] ?? `${file.replace(/\.[^.]+$/, "")}_clip.mp4`;
-    const blob = await res.blob();
-    return { blob, filename };
-  },
+        `?start=${encodeURIComponent(startSeconds.toFixed(3))}` +
+        `&end=${encodeURIComponent(endSeconds.toFixed(3))}` +
+        (speed > 1 ? `&speed=${encodeURIComponent(speed)}` : ""),
+      { method: "POST" },
+    ).then(json<ClipJob>),
+  clipJob: (id: string) =>
+    fetch(`/api/clips/${encodeURIComponent(id)}`).then(json<ClipJob>),
+  cancelClip: (id: string) =>
+    fetch(`/api/clips/${encodeURIComponent(id)}`, { method: "DELETE" }).then(
+      json<{ ok: boolean }>,
+    ),
+  clipDownloadUrl: (id: string) =>
+    `/api/clips/${encodeURIComponent(id)}/download`,
 
   setRetention: (retention_days: number) =>
     fetch("/api/config/retention", {

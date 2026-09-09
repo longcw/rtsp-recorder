@@ -8,7 +8,7 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
-import type { RecordingFile, Waveform } from "../types";
+import type { ClipJob, RecordingFile, Waveform } from "../types";
 import { api } from "../api";
 import { useToast } from "./Toast";
 import { decodePeaks, WaveformStrip } from "./Waveform";
@@ -27,7 +27,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
   const [duration, setDuration] = useState<number | null>(null);
   const [clipStart, setClipStart] = useState<number | null>(null);
   const [clipEnd, setClipEnd] = useState<number | null>(null);
-  const [exporting, setExporting] = useState(false);
+  const [exportJob, setExportJob] = useState<ClipJob | null>(null);
   const [exportSpeed, setExportSpeed] = useState(1);
   const [rate, setRate] = useState(1);
   // True when autoplay was only allowed because we muted the element. Drives
@@ -176,32 +176,50 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
 
   async function exportClip() {
     if (clipStart === null || clipEnd === null) return;
-    setExporting(true);
+    // The server runs ffmpeg as a job; poll it so a multi-minute re-encode
+    // shows progress instead of a frozen spinner, then hand the finished file
+    // to the browser's own download manager rather than buffering it here.
+    let job: ClipJob;
     try {
-      const { blob, filename } = await api.clipFile(
+      job = await api.startClip(
         streamName,
         file.name,
         clipStart,
         clipEnd,
         exportSpeed,
       );
-      const objUrl = URL.createObjectURL(blob);
+      setExportJob(job);
+      while (job.state === "running") {
+        await new Promise((r) => setTimeout(r, 500));
+        job = await api.clipJob(job.id);
+        setExportJob(job);
+      }
+    } catch (e) {
+      setExportJob(null);
+      toast("error", e instanceof Error ? e.message : String(e));
+      return;
+    }
+    setExportJob(null);
+    if (job.state === "error") {
+      toast("error", job.error ?? "Export failed.");
+    } else if (job.state === "done") {
       const a = document.createElement("a");
-      a.href = objUrl;
-      a.download = filename;
+      a.href = api.clipDownloadUrl(job.id);
+      a.download = job.download_name;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      // Revoke after a tick so the download has started.
-      setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
       toast("success", "Clip exported.");
-    } catch (e) {
-      toast("error", e instanceof Error ? e.message : String(e));
-    } finally {
-      setExporting(false);
     }
   }
 
+  function cancelExport() {
+    if (!exportJob) return;
+    // the poll loop sees the cancelled state and stops on its own
+    api.cancelClip(exportJob.id).catch(() => {});
+  }
+
+  const exporting = exportJob !== null;
   const canExport =
     clipStart !== null && clipEnd !== null && clipEnd > clipStart && !exporting;
   const clipDuration =
@@ -316,7 +334,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
           duration={duration}
           clipStart={clipStart}
           clipEnd={clipEnd}
-          exporting={exporting}
+          exportProgress={exportJob?.progress ?? null}
           canExport={canExport}
           clipDuration={clipDuration}
           exportSpeed={exportSpeed}
@@ -326,6 +344,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
           onSeek={seekTo}
           onClear={clearMarks}
           onExport={exportClip}
+          onCancel={cancelExport}
         />
       </div>
     </div>
@@ -475,7 +494,8 @@ interface TrimBarProps {
   duration: number | null;
   clipStart: number | null;
   clipEnd: number | null;
-  exporting: boolean;
+  // null when idle, otherwise 0..1 of the export done so far
+  exportProgress: number | null;
   canExport: boolean;
   clipDuration: number | null;
   exportSpeed: number;
@@ -485,6 +505,7 @@ interface TrimBarProps {
   onSeek: (s: number) => void;
   onClear: () => void;
   onExport: () => void;
+  onCancel: () => void;
 }
 
 function TrimBar({
@@ -492,7 +513,7 @@ function TrimBar({
   duration,
   clipStart,
   clipEnd,
-  exporting,
+  exportProgress,
   canExport,
   clipDuration,
   exportSpeed,
@@ -502,8 +523,10 @@ function TrimBar({
   onSeek,
   onClear,
   onExport,
+  onCancel,
 }: TrimBarProps) {
   const hasMarks = clipStart !== null || clipEnd !== null;
+  const exporting = exportProgress !== null;
   return (
     <div className="border-t border-white/[0.06] px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
       <div className="flex items-center gap-2 text-ink-400">
@@ -569,18 +592,36 @@ function TrimBar({
             </option>
           ))}
         </select>
+        {exporting && (
+          <button
+            className="text-xs text-ink-300 hover:text-ink-100 underline-offset-2 hover:underline"
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+        )}
         <button
-          className="btn-primary inline-flex items-center gap-1.5 px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+          className="btn-primary relative overflow-hidden inline-flex items-center gap-1.5 px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
           onClick={onExport}
           disabled={!canExport}
           title={canExport ? "Export clip" : "Set both start and end first"}
         >
-          {exporting ? (
-            <Loader2 size={13} className="animate-spin" />
-          ) : (
-            <Download size={13} />
+          {exporting && (
+            <span
+              className="absolute inset-y-0 left-0 bg-white/20 transition-[width] duration-300"
+              style={{ width: `${Math.round(exportProgress * 100)}%` }}
+            />
           )}
-          {exporting ? "Exporting…" : "Export clip"}
+          <span className="relative inline-flex items-center gap-1.5">
+            {exporting ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <Download size={13} />
+            )}
+            {exporting
+              ? `Exporting… ${Math.round(exportProgress * 100)}%`
+              : "Export clip"}
+          </span>
         </button>
       </div>
     </div>

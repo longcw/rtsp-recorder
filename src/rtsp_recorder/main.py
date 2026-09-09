@@ -4,6 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
+import shutil
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from . import audio_index, audio_peaks, idle_index
 from .config import ConfigStore
@@ -76,11 +80,22 @@ _SEGMENT_NAME_FMT = "%Y-%m-%d_%H-%M-%S"
 # multipart/byteranges would require a substantially more involved encoder.
 _RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$")
 _RANGE_CHUNK = 64 * 1024
-_CLIP_CHUNK = 256 * 1024
+
+# How long a finished clip export waits to be downloaded before it is swept.
+_CLIP_KEEP_SECONDS = 15 * 60
 
 # Bars in the per-recording waveform thumbnails. Enough to read at thumbnail
 # width, small enough that one response can carry every file in a stream.
 _LIST_WAVEFORM_BUCKETS = 48
+
+
+def _clip_status(job: dict) -> dict:
+    return {
+        "state": job["state"],
+        "progress": job["progress"],
+        "error": job["error"],
+        "download_name": job["download_name"],
+    }
 
 
 def _range_not_satisfiable(file_size: int) -> StreamingResponse:
@@ -117,13 +132,24 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     store = ConfigStore(config_path)
     manager = RecorderManager(store, recordings_dir)
 
+    # Clip exports in flight or waiting to be downloaded, keyed by job id.
+    # Their files live under clips_dir, which is wiped on startup because a
+    # job cannot outlive the process that tracks it.
+    clips_dir = data_dir / "clips"
+    clip_jobs: dict[str, dict] = {}
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        shutil.rmtree(clips_dir, ignore_errors=True)
+        clips_dir.mkdir(parents=True, exist_ok=True)
         await store.load()
         await manager.start()
         try:
             yield
         finally:
+            for job in clip_jobs.values():
+                if job["proc"] is not None and job["proc"].returncode is None:
+                    job["proc"].kill()
             await manager.shutdown()
 
     app = FastAPI(title="rtsp-recorder", lifespan=lifespan)
@@ -421,14 +447,14 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             logger.warning("open failed for %s: %s", target, e)
             raise HTTPException(status_code=503, detail="server busy") from e
 
-    @app.get("/api/streams/{name}/files/{filename}/clip")
-    async def clip_file(
+    @app.post("/api/streams/{name}/files/{filename}/clip", response_model=dict)
+    async def start_clip(
         name: str,
         filename: str,
         start: float = Query(..., ge=0.0),
         end: float = Query(..., gt=0.0),
         speed: float = Query(1.0, ge=1.0, le=64.0),
-    ):
+    ) -> dict:
         if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
             raise HTTPException(status_code=400, detail="invalid filename")
         if end <= start:
@@ -448,20 +474,31 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if not target.is_file():
             raise HTTPException(status_code=404, detail="not found")
 
-        # Stream fragmented MP4 straight from ffmpeg's stdout. A plain MP4
-        # needs its moov atom written last, which would mean buffering the
-        # whole clip before answering; a sped-up clip re-encodes at only a
-        # few times realtime, and a reverse proxy in front of us gives up on
-        # a request that stays silent that long. Fragments start flowing
-        # within a second instead.
+        # An export is a job, not a request: ffmpeg runs in the background
+        # while the client polls for progress, then fetches the finished file.
+        # Holding one HTTP request open for a multi-minute re-encode would run
+        # into any reverse proxy's read timeout and give the user no feedback.
+        # Finished jobs nobody collected are swept on the next start.
+        now = time.monotonic()
+        for job_id, job in list(clip_jobs.items()):
+            if job["state"] != "running" and now - job["finished_at"] > _CLIP_KEEP_SECONDS:
+                job["path"].unlink(missing_ok=True)
+                clip_jobs.pop(job_id, None)
+
         stem = filename.rsplit(".", 1)[0]
         speed_tag = "" if speed <= 1.0 else f"_{speed:g}x"
         download_name = (
             f"{stem}_clip_{int(round(start))}-{int(round(end))}{speed_tag}.mp4"
         )
-        base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+        job_id = secrets.token_urlsafe(8)
+        path = clips_dir / f"{job_id}.mp4"
+        out_duration = (end - start) / speed
+        base = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-nostats", "-progress", "pipe:1",
+        ]
         trim = ["-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(target)]
-        out = ["-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
+        out = ["-movflags", "+faststart", str(path)]
         if speed <= 1.0:
             attempts = [
                 [*base, *trim, "-c", "copy", "-avoid_negative_ts", "make_zero", *out]
@@ -472,9 +509,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             # decimate frames instead of encoding every source frame. Every
             # source frame still has to be decoded, and that dominates, so
             # try NVDEC + NVENC first and fall back to the CPU when there is
-            # no usable card. Keyframes every 2s of output keep the fragments
-            # short.
-            speedup = ["-vf", f"setpts=PTS/{speed:g},fps=30", "-an", "-g", "60"]
+            # no usable card.
+            speedup = ["-vf", f"setpts=PTS/{speed:g},fps=30", "-an"]
             attempts = [
                 [
                     *base, "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
@@ -491,52 +527,102 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 ],
             ]
 
-        # Wait for the first bytes before committing to a 200: anything that
-        # fails at setup (no GPU, bad codec, unreadable file) exits with no
-        # output, and that is when we can still fall back or report an error.
-        for i, args in enumerate(attempts):
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            except FileNotFoundError:
-                raise HTTPException(status_code=500, detail="ffmpeg not available")
-            err_task = asyncio.create_task(proc.stderr.read())
-            first = await proc.stdout.read(_CLIP_CHUNK)
-            if first:
-                break
-            await proc.wait()
-            tail = (await err_task).decode(errors="replace").strip().splitlines()[-1:]
-            detail = tail[0] if tail else "ffmpeg failed"
-            if i + 1 < len(attempts):
-                logger.info("clip %s: GPU path unavailable (%s), using CPU", download_name, detail)
-                continue
-            raise HTTPException(status_code=500, detail=f"clip failed: {detail}")
+        job: dict = {
+            "state": "running",
+            "progress": 0.0,
+            "error": None,
+            "download_name": download_name,
+            "path": path,
+            "proc": None,
+            "finished_at": 0.0,
+        }
 
-        async def stream() -> AsyncIterator[bytes]:
+        async def run() -> None:
             try:
-                yield first
-                while chunk := await proc.stdout.read(_CLIP_CHUNK):
-                    yield chunk
-                await proc.wait()
-                if proc.returncode != 0:
+                for i, args in enumerate(attempts):
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            *args,
+                            stdin=asyncio.subprocess.DEVNULL,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                    except FileNotFoundError:
+                        job.update(state="error", error="ffmpeg not available")
+                        return
+                    job["proc"] = proc
+                    err_task = asyncio.create_task(proc.stderr.read())
+                    # -progress prints key=value blocks; out_time_us is how much
+                    # of the output exists so far, and it stays N/A until the
+                    # first frame lands. Anything that fails at setup (no GPU,
+                    # bad codec) exits before that, which is when a fallback
+                    # is still safe.
+                    produced = False
+                    async for raw in proc.stdout:
+                        key, _, value = raw.decode(errors="replace").strip().partition("=")
+                        if key == "out_time_us" and value.isdigit():
+                            produced = True
+                            job["progress"] = min(1.0, int(value) / 1_000_000 / out_duration)
+                    await proc.wait()
+                    if job["state"] == "cancelled":
+                        return
+                    if proc.returncode == 0:
+                        job.update(state="done", progress=1.0)
+                        return
                     tail = (await err_task).decode(errors="replace").strip().splitlines()[-1:]
-                    logger.warning(
-                        "clip %s: ffmpeg exited %d: %s",
-                        download_name, proc.returncode, tail[0] if tail else "",
-                    )
+                    detail = tail[0] if tail else "ffmpeg failed"
+                    if not produced and i + 1 < len(attempts):
+                        logger.info("clip %s: GPU path unavailable (%s), using CPU", download_name, detail)
+                        continue
+                    logger.warning("clip %s: %s", download_name, detail)
+                    job.update(state="error", error=f"clip failed: {detail}")
+                    return
             finally:
-                # the client went away mid-clip; don't keep encoding for nobody
-                if proc.returncode is None:
-                    proc.kill()
+                job["finished_at"] = time.monotonic()
+                if job["state"] != "done":
+                    path.unlink(missing_ok=True)
 
-        return StreamingResponse(
-            stream(),
+        job["task"] = asyncio.create_task(run())
+        clip_jobs[job_id] = job
+        return {"id": job_id, **_clip_status(job)}
+
+    @app.get("/api/clips/{job_id}", response_model=dict)
+    async def clip_status(job_id: str) -> dict:
+        job = clip_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such export")
+        return {"id": job_id, **_clip_status(job)}
+
+    @app.delete("/api/clips/{job_id}", response_model=dict)
+    async def cancel_clip(job_id: str) -> dict:
+        job = clip_jobs.pop(job_id, None)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such export")
+        if job["state"] == "running":
+            job["state"] = "cancelled"
+            if job["proc"] is not None and job["proc"].returncode is None:
+                job["proc"].kill()
+        else:
+            job["path"].unlink(missing_ok=True)
+        return {"ok": True}
+
+    @app.get("/api/clips/{job_id}/download")
+    async def download_clip(job_id: str):
+        job = clip_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such export")
+        if job["state"] != "done":
+            raise HTTPException(status_code=409, detail=f"export is {job['state']}")
+
+        def _cleanup() -> None:
+            job["path"].unlink(missing_ok=True)
+            clip_jobs.pop(job_id, None)
+
+        return FileResponse(
+            job["path"],
             media_type="video/mp4",
-            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+            filename=job["download_name"],
+            background=BackgroundTask(_cleanup),
         )
 
     # ---- retention / config ----
