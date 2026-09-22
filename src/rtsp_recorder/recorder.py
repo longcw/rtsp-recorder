@@ -46,6 +46,13 @@ AUDIO_PROBE_INTERVAL_SECONDS = 3
 # phase, where no segment file exists yet for the watchdog to stat).
 FFMPEG_SOCKET_TIMEOUT_US = 10_000_000
 
+# How often to re-check for audio while recording a source that advertised an
+# audio track we could not confirm. The confirmation probe cannot tell a track
+# that is permanently dead from one whose bridge happened to be reconnecting,
+# so the distinction is drawn over time instead: keep looking, and pick the
+# audio up the moment it actually carries packets.
+AUDIO_RECHECK_INTERVAL_SECONDS = 60.0
+
 # Hard cap on the one-shot codec probe (ffprobe) we run before recording so a
 # slow/unreachable camera can't stall startup. The socket timeout above makes
 # ffprobe bail on a dead connection well before this; this just bounds the
@@ -110,6 +117,9 @@ class StreamRecorder:
         # is a legitimate result.
         self._audio_codec: str | None = None
         self._probed: bool = False
+        # True while we record video-only from a source that advertised audio,
+        # which keeps _watch_for_audio running until the track shows up.
+        self._audio_pending: bool = False
         # Seconds to wait before the next restart, doubled on each consecutive
         # failure and reset once recording succeeds.
         self._backoff: float = RESTART_BACKOFF_SECONDS
@@ -263,15 +273,19 @@ class StreamRecorder:
         # avoid the pipe filling up.
         assert self._proc.stderr is not None
         stderr_task = asyncio.create_task(self._consume_stderr(self._proc.stderr))
-        watchdog_task = asyncio.create_task(self._watchdog())
+        helpers = [asyncio.create_task(self._watchdog())]
+        if self._audio_pending:
+            helpers.append(asyncio.create_task(self._watch_for_audio()))
         try:
             code = await self._proc.wait()
         finally:
-            watchdog_task.cancel()
-            try:
-                await watchdog_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            for task in helpers:
+                task.cancel()
+            for task in helpers:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
             # Drain remaining stderr before tearing down. ffmpeg's last lines
             # (the failure cause, or the final segment-Opening) typically arrive
             # right before exit; cancelling immediately would lose them and
@@ -369,6 +383,28 @@ class StreamRecorder:
                     await self._kill_proc()
                     return
 
+    async def _watch_for_audio(self) -> None:
+        """Restart ffmpeg once a source's advertised audio starts flowing.
+
+        ffmpeg's inputs are fixed for the life of the process, so a run that
+        started video-only stays silent for as long as it lasts — and a healthy
+        run lasts indefinitely. Only a confirmed track restarts anything, so a
+        source whose audio never returns simply keeps recording video.
+        """
+        while True:
+            try:
+                await asyncio.sleep(AUDIO_RECHECK_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                return
+            if not await self._audio_carries_packets():
+                continue
+            logger.info(
+                "recorder %s: audio arrived late; restarting to record it",
+                self.stream.name,
+            )
+            await self._kill_proc()
+            return
+
     async def _kill_proc(self, grace: float = KILL_GRACE_SECONDS) -> None:
         """Stop ffmpeg, escalating SIGTERM -> SIGKILL if it doesn't exit.
 
@@ -415,10 +451,10 @@ class StreamRecorder:
         None when the source has no audio *or* advertises one that never
         delivers packets — see ``_audio_carries_packets``.
 
-        Runs sequentially before the recording ffmpeg starts, so we never hold
-        two RTSP connections at once. Bounded by the socket timeout and a hard
-        wall-clock cap so an unreachable camera can't stall startup.
+        Runs before the recording ffmpeg starts, bounded by the socket timeout
+        and a hard wall-clock cap so an unreachable camera can't stall startup.
         """
+        self._audio_pending = False
         out = await self._run_ffprobe(
             [
                 "-show_entries",
@@ -450,10 +486,11 @@ class StreamRecorder:
         if audio and not await self._audio_carries_packets():
             logger.warning(
                 "recorder %s: source advertises %s audio but sent no packets; "
-                "recording video only",
+                "recording video only and still watching for it",
                 self.stream.name,
                 audio,
             )
+            self._audio_pending = True
             audio = None
         return video, audio
 
@@ -465,6 +502,12 @@ class StreamRecorder:
         negotiated. Recording that phantom track is worse than skipping it: the
         segment muxer waits on a stream that never advances, so rotation stalls
         and one short file is left behind instead of a series.
+
+        False does not mean the track is dead for good: a source that is
+        mid-reconnect fails this check exactly like one whose audio will never
+        return, since both starve the probe until it times out. Callers must
+        treat a negative as provisional and keep re-checking, which is the one
+        case where this opens a second RTSP connection alongside the recording.
         """
         out = await self._run_ffprobe(
             [

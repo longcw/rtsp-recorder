@@ -125,5 +125,42 @@ class BackoffTest(unittest.TestCase):
         self.assertEqual(rec.status().audio_codec, "pcm_alaw")
 
 
+class PendingAudioTest(unittest.IsolatedAsyncioTestCase):
+    """An advertised track that fails the packet check must stay under watch."""
+
+    async def _probe(self, streams: str, carries: bool) -> StreamRecorder:
+        rec = _make_recorder()
+
+        async def fake_ffprobe(extra: list[str], timeout: float) -> str | None:
+            if "-select_streams" in extra:
+                return "100\n" if carries else None
+            return streams
+
+        rec._run_ffprobe = fake_ffprobe  # type: ignore[method-assign]
+        self.probed = await rec._probe_streams()
+        return rec
+
+    async def test_dropped_audio_is_pending(self) -> None:
+        rec = await self._probe(
+            "codec_type=video|codec_name=hevc\ncodec_type=audio|codec_name=opus",
+            carries=False,
+        )
+        self.assertEqual(self.probed, ("hevc", None))
+        self.assertTrue(rec._audio_pending)
+
+    async def test_confirmed_audio_is_not_pending(self) -> None:
+        rec = await self._probe(
+            "codec_type=video|codec_name=hevc\ncodec_type=audio|codec_name=opus",
+            carries=True,
+        )
+        self.assertEqual(self.probed, ("hevc", "opus"))
+        self.assertFalse(rec._audio_pending)
+
+    async def test_source_without_audio_is_not_pending(self) -> None:
+        rec = await self._probe("codec_type=video|codec_name=hevc", carries=False)
+        self.assertEqual(self.probed, ("hevc", None))
+        self.assertFalse(rec._audio_pending)
+
+
 if __name__ == "__main__":
     unittest.main()
