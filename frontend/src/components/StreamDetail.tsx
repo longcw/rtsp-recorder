@@ -460,7 +460,7 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
                             <PlayCircle size={15} />
                           </button>
                           <a
-                            href={api.fileUrl(stream.name, f.name)}
+                            href={api.fileUrl(stream.name, f.name, live ? f.size : undefined)}
                             download
                             onClick={(e) => e.stopPropagation()}
                             className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-white/[0.06] text-ink-300 hover:text-ink-100"

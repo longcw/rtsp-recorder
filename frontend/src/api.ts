@@ -57,12 +57,16 @@ export const api = {
       json<RecordingFile[]>,
     ),
 
-  fileUrl: (stream: string, file: string) =>
-    `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}`,
+  // `liveSize` pins a live segment to the bytes written so far, served with
+  // a fragment index so the browser can play it without reading it all.
+  fileUrl: (stream: string, file: string, liveSize?: number) =>
+    `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}` +
+    (liveSize === undefined ? "" : `?size=${liveSize}`),
 
-  waveform: (stream: string, file: string) =>
+  waveform: (stream: string, file: string, liveSize?: number) =>
     fetch(
-      `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}/waveform`,
+      `/api/streams/${encodeURIComponent(stream)}/files/${encodeURIComponent(file)}/waveform` +
+        (liveSize === undefined ? "" : `?size=${liveSize}`),
     ).then(json<Waveform>),
 
   // Thumbnail-resolution peaks for every analyzed file in the stream, keyed by

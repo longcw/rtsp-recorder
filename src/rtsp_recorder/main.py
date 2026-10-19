@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import secrets
+import struct
 import shutil
 import time
 from contextlib import asynccontextmanager
@@ -21,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from . import audio_index, audio_peaks, idle_index
+from . import audio_index, audio_peaks, idle_index, sidx
 from .config import ConfigStore
 from .manager import RecorderManager
 from .models import (
@@ -118,6 +119,17 @@ def _parse_segment_filename(name: str) -> datetime | None:
     try:
         return datetime.strptime(stem, _SEGMENT_NAME_FMT)
     except ValueError:
+        return None
+
+
+async def _live_index(target: Path, size: int | None) -> sidx.LiveIndex | None:
+    """Index a live segment's snapshot at ``size`` bytes; None when finalized or unset."""
+    if size is None:
+        return None
+    try:
+        return await asyncio.to_thread(sidx.read_index, target, min(size, target.stat().st_size))
+    except (OSError, struct.error, IndexError) as e:
+        logger.warning("live index failed for %s: %s", target, e)
         return None
 
 
@@ -297,10 +309,23 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         return out
 
     @app.get("/api/streams/{name}/files/{filename}/waveform", response_model=dict)
-    async def file_waveform(name: str, filename: str) -> dict:
+    async def file_waveform(
+        name: str,
+        filename: str,
+        # same snapshot as the player's ?size, decoded on demand while live
+        size: int | None = Query(None, ge=0),
+    ) -> dict:
         if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
             raise HTTPException(status_code=400, detail="invalid filename")
         target = _resolve_stream_dir(name)
+        index = await _live_index(target / filename, size)
+        if index is not None:
+            peaks = await audio_peaks.live_peaks(target / filename, index)
+            return {
+                "peaks": audio_peaks.encode(peaks) if peaks else None,
+                "duration": index.seconds,
+                "pending": False,
+            }
         entry = (await asyncio.to_thread(audio_index.load, target)).get(filename)
         if not isinstance(entry, dict):
             # Not looked at yet — the analyzer skips the live segment and
@@ -365,7 +390,14 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         return {"name": filename, "idle": body.idle}
 
     @app.get("/api/streams/{name}/files/{filename}")
-    async def download_file(name: str, filename: str, request: Request):
+    async def download_file(
+        name: str,
+        filename: str,
+        request: Request,
+        # Byte size of the live segment the client saw; serves an indexed
+        # snapshot cut at that point (see sidx.py). Ignored once finalized.
+        size: int | None = Query(None, ge=0),
+    ):
         if "/" in filename or "\\" in filename or filename in ("", ".", ".."):
             raise HTTPException(status_code=400, detail="invalid filename")
         target = _resolve_stream_dir(name) / filename
@@ -377,18 +409,24 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="not found")
 
         file_size = target.stat().st_size
+        index = await _live_index(target, size)
+        view = index.view() if index else None
+        pieces, file_size = view if view else ([(0, file_size)], file_size)
+
         range_header = request.headers.get("range")
-        if range_header:
-            m = _RANGE_RE.match(range_header.strip())
-            if not m:
-                # Per RFC 9110, an unparseable Range should be ignored, but
-                # we'd rather be explicit so misbehaving clients notice.
-                raise HTTPException(status_code=400, detail="invalid Range header")
-            start = int(m.group(1))
-            end = int(m.group(2)) if m.group(2) else file_size - 1
-            if start >= file_size or start > end:
-                return _range_not_satisfiable(file_size)
-            end = min(end, file_size - 1)
+        if range_header or view:
+            start, end = 0, file_size - 1
+            if range_header:
+                m = _RANGE_RE.match(range_header.strip())
+                if not m:
+                    # Per RFC 9110, an unparseable Range should be ignored, but
+                    # we'd rather be explicit so misbehaving clients notice.
+                    raise HTTPException(status_code=400, detail="invalid Range header")
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else file_size - 1
+                if start >= file_size or start > end:
+                    return _range_not_satisfiable(file_size)
+                end = min(end, file_size - 1)
             length = end - start + 1
 
             # Open up-front so an FD-exhaustion error surfaces as a clean 503
@@ -400,40 +438,46 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             except OSError as e:
                 logger.warning("open failed for %s: %s", target, e)
                 raise HTTPException(status_code=503, detail="server busy") from e
-            try:
-                f.seek(start)
-            except OSError:
-                f.close()
-                raise
 
             def iter_range():
                 # OS page cache handles the hot path. Chunking caps memory
                 # and lets uvicorn flush progressively while the client
                 # buffers ahead.
                 try:
-                    remaining = length
-                    while remaining > 0:
-                        data = f.read(min(_RANGE_CHUNK, remaining))
-                        if not data:
-                            break
-                        remaining -= len(data)
-                        yield data
+                    pos = 0
+                    for piece in pieces:
+                        piece_len = len(piece) if isinstance(piece, bytes) else piece[1]
+                        lo, hi = max(start, pos), min(end + 1, pos + piece_len)
+                        if lo < hi and isinstance(piece, bytes):
+                            yield piece[lo - pos : hi - pos]
+                        elif lo < hi:
+                            f.seek(piece[0] + lo - pos)
+                            remaining = hi - lo
+                            while remaining > 0:
+                                data = f.read(min(_RANGE_CHUNK, remaining))
+                                if not data:
+                                    return
+                                remaining -= len(data)
+                                yield data
+                        pos += piece_len
                 finally:
                     f.close()
 
+            headers = {
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(length),
+                # Keep the filename hint so explicit downloads still get
+                # a nice name. The browser ignores Content-Disposition
+                # for media elements, so <video> playback is unaffected.
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            }
+            if range_header:
+                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
             return StreamingResponse(
                 iter_range(),
-                status_code=206,
+                status_code=206 if range_header else 200,
                 media_type="video/mp4",
-                headers={
-                    "Content-Range": f"bytes {start}-{end}/{file_size}",
-                    "Accept-Ranges": "bytes",
-                    "Content-Length": str(length),
-                    # Keep the filename hint so explicit downloads still get
-                    # a nice name. The browser ignores Content-Disposition
-                    # for media elements, so <video> playback is unaffected.
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                },
+                headers=headers,
             )
 
         try:

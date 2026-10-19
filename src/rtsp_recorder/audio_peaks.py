@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from .idle_detector import probe_duration
+from .sidx import LiveIndex
 
 logger = logging.getLogger(__name__)
 
@@ -68,19 +69,72 @@ async def analyze_audio(path: Path) -> PeaksResult:
 
 def peaks_from_samples(samples: np.ndarray, seconds: float) -> list[int]:
     """Reduce mono int16 PCM to per-bucket levels on the fixed dBFS scale."""
+    return _levels(np.abs(samples.astype(np.int32)), seconds)
+
+
+def _levels(amp: np.ndarray, seconds: float) -> list[int]:
+    """Bucket evenly spaced amplitudes (samples, or an envelope of them) to levels."""
     n = min(_MAX_BUCKETS, max(_MIN_BUCKETS, round(seconds * _BUCKETS_PER_SECOND)))
-    n = min(n, samples.size)
+    n = min(n, amp.size)
     if n <= 0:
         return []
     # Bucket by edges rather than reshaping: the sample count rarely divides
     # evenly, and dropping the remainder would lop the tail off the clip.
-    edges = np.linspace(0, samples.size, n + 1).astype(np.int64)
-    amp = np.abs(samples.astype(np.int32))
+    edges = np.linspace(0, amp.size, n + 1).astype(np.int64)
     peaks = np.maximum.reduceat(amp, edges[:-1])
     with np.errstate(divide="ignore"):
         db = 20.0 * np.log10(peaks / _FULL_SCALE)
     level = (db - _FLOOR_DB) / (-_FLOOR_DB) * 255.0
     return [int(v) for v in np.clip(level, 0.0, 255.0).round()]
+
+
+@dataclass
+class _LiveEnvelope:
+    fragments: int  # fragments decoded so far
+    env: np.ndarray  # int32 peak per _ENV_STEP samples
+    tail: np.ndarray  # int16 samples not yet filling a whole step
+
+
+# Envelope resolution kept for live segments: 50 ms at 8 kHz, so an hour is
+# ~72k values instead of 29M samples.
+_ENV_STEP = 400
+
+_live: dict[Path, _LiveEnvelope] = {}
+_live_lock = asyncio.Lock()
+
+
+async def live_peaks(path: Path, index: LiveIndex) -> list[int] | None:
+    """Waveform of a live segment's indexed snapshot, or None without audio.
+
+    Keeps an envelope per live file and decodes only fragments added since the
+    last call, since decoding a near-full hour of audio takes several seconds.
+    """
+    async with _live_lock:
+        state = _live.get(path)
+        if state is None or state.fragments > len(index.fragments):
+            state = _LiveEnvelope(0, np.zeros(0, np.int32), np.zeros(0, np.int16))
+        if state.fragments < len(index.fragments):
+            # a fragmented mp4 is valid as its header plus any run of fragments
+            start = index.fragments[state.fragments][0]
+            end = index.fragments[-1][1]
+            samples = await _decode_pcm(path, ((0, index.head_end), (start, end - start)))
+            if samples is None:
+                return None
+            samples = np.concatenate([state.tail, samples])
+            whole = samples.size - samples.size % _ENV_STEP
+            amp = np.abs(samples[:whole].astype(np.int32)).reshape(-1, _ENV_STEP).max(axis=1)
+            state = _LiveEnvelope(
+                len(index.fragments), np.concatenate([state.env, amp]), samples[whole:]
+            )
+        # one live file per stream: drop the envelope of the segment this one followed
+        for other in [p for p in _live if p.parent == path.parent and p != path]:
+            del _live[other]
+        _live[path] = state
+    tail = [np.abs(state.tail.astype(np.int32)).max()] if state.tail.size else []
+    amp = np.concatenate([state.env, np.array(tail, np.int32)])
+    if amp.size == 0:
+        return None
+    return _levels(amp, (state.env.size * _ENV_STEP + state.tail.size) / _SAMPLE_RATE)
 
 
 def encode(peaks: list[int]) -> str:
@@ -128,14 +182,19 @@ async def _has_audio_stream(path: Path) -> bool:
     return out.decode(errors="replace").strip() == "audio"
 
 
-async def _decode_pcm(path: Path) -> np.ndarray | None:
-    """Decode the first audio track to mono int16 at `_SAMPLE_RATE`."""
+async def _decode_pcm(
+    path: Path, spans: tuple[tuple[int, int], ...] | None = None
+) -> np.ndarray | None:
+    """Decode the first audio track to mono int16 at `_SAMPLE_RATE`.
+
+    With `spans`, decodes only those (offset, length) byte ranges, joined.
+    """
     args = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
-        "-nostdin",
-        "-i", str(path),
+        *(() if spans else ("-nostdin",)),
+        "-i", "pipe:0" if spans else str(path),
         "-map", "0:a:0",
         "-vn",
         "-ac", "1",
@@ -145,7 +204,7 @@ async def _decode_pcm(path: Path) -> np.ndarray | None:
     ]
     proc = await asyncio.create_subprocess_exec(
         *args,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if spans else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -153,7 +212,29 @@ async def _decode_pcm(path: Path) -> np.ndarray | None:
     # Drain stderr concurrently — a full error pipe would deadlock the decoder
     # before it reaches EOF on stdout.
     stderr_task = asyncio.create_task(proc.stderr.read())
+
+    async def feed(stdin: asyncio.StreamWriter, spans: tuple[tuple[int, int], ...]) -> None:
+        try:
+            with open(path, "rb") as f:
+                for offset, length in spans:
+                    f.seek(offset)
+                    while length > 0:
+                        data = await asyncio.to_thread(f.read, min(1 << 20, length))
+                        if not data:
+                            break
+                        length -= len(data)
+                        stdin.write(data)
+                        await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # ffmpeg exits early when the input has no audio track
+            pass
+        finally:
+            stdin.close()
+
+    feed_task = asyncio.create_task(feed(proc.stdin, spans)) if spans else None
     out = await proc.stdout.read()
+    if feed_task is not None:
+        await feed_task
     rc = await proc.wait()
     err = await stderr_task
     if rc != 0:
@@ -168,3 +249,4 @@ async def _decode_pcm(path: Path) -> np.ndarray | None:
     # A truncated final sample would misalign the whole int16 view.
     usable = len(out) - (len(out) % 2)
     return np.frombuffer(out[:usable], dtype=np.int16)
+

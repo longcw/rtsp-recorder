@@ -141,7 +141,13 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
     };
   }, []);
 
-  const url = api.fileUrl(streamName, file.name);
+  // pinned per file: the list keeps polling a growing size, and a new URL
+  // would reload the player
+  const liveSize = useMemo(
+    () => (live ? file.size : undefined),
+    [streamName, file.name],
+  );
+  const url = api.fileUrl(streamName, file.name, liveSize);
   const subtitle = formatSubtitle(file);
 
   function setStartHere() {
@@ -321,7 +327,7 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
         <AudioTimeline
           streamName={streamName}
           file={file.name}
-          live={live}
+          liveSize={liveSize}
           duration={duration}
           currentTime={currentTime}
           onSeek={seekTo}
@@ -358,14 +364,14 @@ const WAVEFORM_RETRY_MS = 10000;
 function AudioTimeline({
   streamName,
   file,
-  live,
+  liveSize,
   duration,
   currentTime,
   onSeek,
 }: {
   streamName: string;
   file: string;
-  live: boolean;
+  liveSize: number | undefined;
   duration: number | null;
   currentTime: number;
   onSeek: (seconds: number) => void;
@@ -374,14 +380,11 @@ function AudioTimeline({
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    // The live segment is still growing, so any waveform we drew would be
-    // both partial and wrong about where the end is.
-    if (live) return;
     let active = true;
     let timer: number | undefined;
     async function load() {
       try {
-        const w = await api.waveform(streamName, file);
+        const w = await api.waveform(streamName, file, liveSize);
         if (!active) return;
         setWave(w);
         if (w.pending) timer = window.setTimeout(load, WAVEFORM_RETRY_MS);
@@ -394,7 +397,7 @@ function AudioTimeline({
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [streamName, file, live]);
+  }, [streamName, file, liveSize]);
 
   const peaks = useMemo(
     () => (wave?.peaks ? decodePeaks(wave.peaks) : null),
@@ -406,9 +409,7 @@ function AudioTimeline({
   const span = Math.max(duration ?? 0, wave?.duration ?? 0);
 
   let body;
-  if (live) {
-    body = <Note>Available once this segment finishes recording.</Note>;
-  } else if (failed) {
+  if (failed) {
     body = <Note>Waveform unavailable.</Note>;
   } else if (wave === null) {
     body = <Note>Loading…</Note>;

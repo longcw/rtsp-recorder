@@ -120,3 +120,49 @@ class AnalyzeAudioTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_HAS_FFMPEG, "ffmpeg/ffprobe not available")
+class LivePeaksTest(unittest.IsolatedAsyncioTestCase):
+    def _make(self, audio: bool = True) -> Path:
+        out = Path(tempfile.mkdtemp()) / "live.mp4"
+        self.addCleanup(shutil.rmtree, out.parent)
+        # a 0.5 s burst at 12 s in otherwise near-silent audio
+        inputs = ["-f", "lavfi", "-i", "testsrc=duration=20:size=128x96:rate=10"]
+        if audio:
+            inputs += ["-f", "lavfi", "-i", "sine=f=440:duration=20,volume='if(between(t,12,12.5),1,0.001)':eval=frame"]
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inputs,
+             "-c:v", "mpeg4", "-g", "10", *(["-c:a", "aac"] if audio else []),
+             "-movflags", "+empty_moov+default_base_moof+frag_keyframe",
+             "-f", "mp4", str(out)],
+            check=True,
+        )
+        return out
+
+    async def test_incremental_matches_one_shot(self) -> None:
+        from rtsp_recorder import audio_peaks, sidx
+
+        p = self._make()
+        size = p.stat().st_size
+        audio_peaks._live.clear()
+        first = await audio_peaks.live_peaks(p, sidx.read_index(p, size // 2))
+        self.assertLess(max(first), 100)  # the burst is not in the first half yet
+        index = sidx.read_index(p, size)
+        incremental = await audio_peaks.live_peaks(p, index)
+        audio_peaks._live.clear()
+        one_shot = await audio_peaks.live_peaks(p, index)
+
+        self.assertEqual(len(incremental), len(one_shot))
+        loud = int(np.argmax(one_shot))
+        self.assertAlmostEqual(loud / len(one_shot), 12 / index.seconds, delta=0.03)
+        self.assertEqual(int(np.argmax(incremental)), loud)
+        # decoder restarts at the chunk seam may shift a bucket by a step, not more
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(incremental, one_shot)), 40)
+
+    async def test_live_file_without_audio_reports_no_peaks(self) -> None:
+        from rtsp_recorder import audio_peaks, sidx
+
+        p = self._make(audio=False)
+        index = sidx.read_index(p, p.stat().st_size)
+        self.assertIsNone(await audio_peaks.live_peaks(p, index))
