@@ -17,16 +17,29 @@ interface Props {
   streamName: string;
   file: RecordingFile;
   live: boolean;
+  // Span to mark and start from, when opened from a saved clip.
+  initialClip?: { start: number; end: number };
   onClose: () => void;
 }
 
-export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
+export function VideoPlayerModal({
+  streamName,
+  file,
+  live,
+  initialClip,
+  onClose,
+}: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const toast = useToast();
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState<number | null>(null);
-  const [clipStart, setClipStart] = useState<number | null>(null);
-  const [clipEnd, setClipEnd] = useState<number | null>(null);
+  const [clipStart, setClipStart] = useState<number | null>(
+    initialClip?.start ?? null,
+  );
+  const [clipEnd, setClipEnd] = useState<number | null>(
+    initialClip?.end ?? null,
+  );
+  const seekedToClip = useRef(false);
   const [exportJob, setExportJob] = useState<ClipJob | null>(null);
   const [exportSpeed, setExportSpeed] = useState(1);
   const [rate, setRate] = useState(1);
@@ -210,12 +223,12 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
       toast("error", job.error ?? "Export failed.");
     } else if (job.state === "done") {
       const a = document.createElement("a");
-      a.href = api.clipDownloadUrl(job.id);
+      a.href = api.savedClipUrl(job.clip_id, job.speed, true);
       a.download = job.download_name;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      toast("success", "Clip exported.");
+      toast("success", "Clip exported and saved under Saved clips.");
     }
   }
 
@@ -318,6 +331,10 @@ export function VideoPlayerModal({ streamName, file, live, onClose }: Props) {
               // Browsers reset playbackRate when a new source loads; re-apply
               // the user's choice so it survives autoplay/metadata load.
               applyRate(rate);
+              if (initialClip && !seekedToClip.current) {
+                seekedToClip.current = true;
+                e.currentTarget.currentTime = initialClip.start;
+              }
               void startPlayback();
             }}
             className="w-full h-full object-contain sm:h-auto sm:max-h-[70vh]"
@@ -448,7 +465,7 @@ function Note({ children }: { children: React.ReactNode }) {
   );
 }
 
-const SPEEDS = [1, 2, 4, 8, 16, 32, 64];
+export const SPEEDS = [1, 2, 4, 8, 16, 32, 64];
 // Most browsers cap HTMLMediaElement.playbackRate at 16x; above this we drive
 // playback by stepping currentTime on a timer (see applyRate).
 const NATIVE_MAX_RATE = 16;
@@ -664,7 +681,7 @@ function Marker({
   );
 }
 
-function fmt(seconds: number): string {
+export function fmt(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00.0";
   const total = Math.max(0, seconds);
   const h = Math.floor(total / 3600);

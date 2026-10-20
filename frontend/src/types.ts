@@ -84,4 +84,23 @@ export interface ClipJob {
   progress: number;
   error: string | null;
   download_name: string;
+  clip_id: string;
+  speed: number;
+}
+
+// A clip kept on the server after export, outside recording retention.
+export interface SavedClip {
+  id: string;
+  stream: string;
+  // Recording it was cut from, and the span within it in seconds.
+  source: string;
+  start: number;
+  end: number;
+  // Naive wall-clock ISO of the clip's first frame, like RecordingFile.started_at.
+  started_at: string | null;
+  created_at: string;
+  // False once retention has pruned the source recording.
+  source_exists: boolean;
+  // 1x is the full-quality copy with audio; faster ones are re-encoded from it.
+  renditions: { speed: number; size: number }[];
 }

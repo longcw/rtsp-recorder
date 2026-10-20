@@ -2,6 +2,7 @@ import type {
   ClipJob,
   Config,
   RecordingFile,
+  SavedClip,
   ServiceStatus,
   Stream,
   Waveform,
@@ -97,8 +98,24 @@ export const api = {
     fetch(`/api/clips/${encodeURIComponent(id)}`, { method: "DELETE" }).then(
       json<{ ok: boolean }>,
     ),
-  clipDownloadUrl: (id: string) =>
-    `/api/clips/${encodeURIComponent(id)}/download`,
+
+  savedClips: () => fetch("/api/saved-clips").then(json<SavedClip[]>),
+  savedClipUrl: (id: string, speed: number, download = false) =>
+    `/api/saved-clips/${encodeURIComponent(id)}/${speed}x.mp4` +
+    (download ? "?download=1" : ""),
+  reexportClip: (id: string, speed: number) =>
+    fetch(
+      `/api/saved-clips/${encodeURIComponent(id)}/export?speed=${encodeURIComponent(speed)}`,
+      { method: "POST" },
+    ).then(json<ClipJob>),
+  deleteSavedClip: (id: string) =>
+    fetch(`/api/saved-clips/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }).then(json<{ ok: boolean }>),
+  deleteRendition: (id: string, speed: number) =>
+    fetch(`/api/saved-clips/${encodeURIComponent(id)}/${speed}x`, {
+      method: "DELETE",
+    }).then(json<{ ok: boolean }>),
 
   setRetention: (retention_days: number) =>
     fetch("/api/config/retention", {

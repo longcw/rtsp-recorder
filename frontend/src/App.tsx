@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Video, X } from "lucide-react";
-import type { ServiceStatus } from "./types";
+import { AlertTriangle, Film, Video, X } from "lucide-react";
+import type { SavedClip, ServiceStatus } from "./types";
 import { api } from "./api";
 import { Header } from "./components/Header";
 import { StreamList } from "./components/StreamList";
 import { StreamDetail } from "./components/StreamDetail";
+import { SavedClips } from "./components/SavedClips";
 import { AddStreamDialog } from "./components/AddStreamDialog";
 import { IdleRetentionCard } from "./components/IdleRetentionCard";
 import { MotionThresholdCard } from "./components/MotionThresholdCard";
@@ -23,6 +24,12 @@ function Dashboard() {
   const [addOpen, setAddOpen] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [showClips, setShowClips] = useState(false);
+  const [openRequest, setOpenRequest] = useState<{
+    file: string;
+    start: number;
+    end: number;
+  } | null>(null);
   const pollTimer = useRef<number | undefined>(undefined);
 
   const refresh = useCallback(async () => {
@@ -94,6 +101,7 @@ function Dashboard() {
 
   const selectStream = useCallback((name: string) => {
     setSelected(name);
+    setShowClips(false);
     // On mobile the list lives in an overlay drawer; picking a stream should
     // dismiss it so the detail is visible. No-op on desktop where it's static.
     setDrawerOpen(false);
@@ -135,7 +143,7 @@ function Dashboard() {
           />
         )}
         <aside
-          className={`border-white/[0.06] flex flex-col min-h-0 bg-ink-900
+          className={`border-white/[0.06] flex flex-col min-h-0 overflow-y-auto bg-ink-900
             fixed inset-y-0 left-0 z-40 w-[85%] max-w-xs border-r shadow-2xl
             transform transition-transform duration-200 ease-out
             ${drawerOpen ? "translate-x-0" : "-translate-x-full"}
@@ -151,10 +159,27 @@ function Dashboard() {
               <X size={18} />
             </button>
           </div>
-          <div className="flex-1 min-h-0">
+          <div className="px-2 pt-2">
+            <button
+              onClick={() => {
+                setShowClips(true);
+                setDrawerOpen(false);
+              }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium border transition-colors ${
+                showClips
+                  ? "bg-accent/10 border-accent/30 text-ink-50"
+                  : "border-transparent text-ink-200 hover:bg-white/[0.04]"
+              }`}
+            >
+              <Film size={15} className="text-accent" />
+              Saved clips
+            </button>
+          </div>
+          {/* never squeezed: the cards below scroll with the sidebar instead */}
+          <div className="flex-auto shrink-0">
             <StreamList
               streams={status?.streams ?? []}
-              selected={selected}
+              selected={showClips ? null : selected}
               onSelect={selectStream}
               onAdd={() => {
                 setDrawerOpen(false);
@@ -189,10 +214,18 @@ function Dashboard() {
           )}
         </aside>
         <section className="min-h-0 overflow-hidden">
-          {selectedStream ? (
+          {showClips ? (
+            <SavedClips
+              onOpenSource={(clip: SavedClip) => {
+                selectStream(clip.stream);
+                setOpenRequest({ file: clip.source, start: clip.start, end: clip.end });
+              }}
+            />
+          ) : selectedStream ? (
             <StreamDetail
               key={selectedStream.name}
               stream={selectedStream}
+              openRequest={openRequest}
               onChanged={refresh}
               onRemoved={() => {
                 setSelected(null);

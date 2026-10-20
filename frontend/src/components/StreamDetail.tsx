@@ -30,6 +30,8 @@ import { decodePeaks, MiniWaveform } from "./Waveform";
 
 interface Props {
   stream: StreamStatus;
+  // Recording to open with a span marked, e.g. a saved clip's source.
+  openRequest?: { file: string; start: number; end: number } | null;
   onChanged: () => void;
   onRemoved: () => void;
 }
@@ -43,13 +45,35 @@ const FILE_POLL_MS_ACTIVE = 1500;
 // them at the file-poll rate would be pure waste.
 const WAVEFORM_REFETCH_MS = 30000;
 
-export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
+export function StreamDetail({
+  stream,
+  openRequest,
+  onChanged,
+  onRemoved,
+}: Props) {
   const toast = useToast();
   const [files, setFiles] = useState<RecordingFile[] | null>(null);
   const [loadingFiles, setLoadingFiles] = useState(true);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
   const [playing, setPlaying] = useState<RecordingFile | null>(null);
+  const [playingClip, setPlayingClip] = useState<
+    { start: number; end: number } | undefined
+  >(undefined);
+  const handledRequest = useRef<typeof openRequest>(null);
+
+  // open the requested recording once the list that holds it has loaded
+  useEffect(() => {
+    if (!openRequest || !files || handledRequest.current === openRequest) return;
+    handledRequest.current = openRequest;
+    const f = files.find((x) => x.name === openRequest.file);
+    if (!f) {
+      toast("error", "That recording has been pruned.");
+      return;
+    }
+    setPlayingClip({ start: openRequest.start, end: openRequest.end });
+    setPlaying(f);
+  }, [openRequest, files, toast]);
   const [confirmDeleteFile, setConfirmDeleteFile] =
     useState<RecordingFile | null>(null);
   const [deletingFile, setDeletingFile] = useState(false);
@@ -589,7 +613,11 @@ export function StreamDetail({ stream, onChanged, onRemoved }: Props) {
           streamName={stream.name}
           file={playing}
           live={playing.name === stream.current_file}
-          onClose={() => setPlaying(null)}
+          initialClip={playingClip}
+          onClose={() => {
+            setPlaying(null);
+            setPlayingClip(undefined);
+          }}
         />
       )}
 
@@ -854,7 +882,7 @@ function Stat({
   );
 }
 
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let v = n / 1024;
@@ -919,7 +947,7 @@ function addSecondsToHms(time: string, seconds: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-function formatTimeRange(
+export function formatTimeRange(
   f: { name: string; started_at: string | null; duration_seconds: number | null },
   live: boolean,
 ): { primary: string; dateLabel: string | null } {

@@ -6,12 +6,11 @@ import logging
 import os
 import secrets
 import struct
-import shutil
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import re
@@ -20,10 +19,10 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from starlette.background import BackgroundTask
 
-from . import audio_index, audio_peaks, idle_index, sidx
+from . import audio_index, audio_peaks, idle_index, saved_clips, sidx
 from .config import ConfigStore
+from .idle_detector import probe_duration
 from .manager import RecorderManager
 from .models import (
     Config,
@@ -82,12 +81,15 @@ _SEGMENT_NAME_FMT = "%Y-%m-%d_%H-%M-%S"
 _RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$")
 _RANGE_CHUNK = 64 * 1024
 
-# How long a finished clip export waits to be downloaded before it is swept.
+# How long a finished export job stays queryable before it is forgotten.
 _CLIP_KEEP_SECONDS = 15 * 60
 
 # Bars in the per-recording waveform thumbnails. Enough to read at thumbnail
 # width, small enough that one response can carry every file in a stream.
 _LIST_WAVEFORM_BUCKETS = 48
+
+
+_CLIP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
 def _clip_status(job: dict) -> dict:
@@ -96,7 +98,15 @@ def _clip_status(job: dict) -> dict:
         "progress": job["progress"],
         "error": job["error"],
         "download_name": job["download_name"],
+        "clip_id": job["clip_id"],
+        "speed": job["speed"],
     }
+
+
+def _clip_download_name(meta: dict, speed: float) -> str:
+    stem = meta["source"].rsplit(".", 1)[0]
+    speed_tag = "" if speed <= 1.0 else f"_{speed:g}x"
+    return f"{stem}_clip_{int(round(meta['start']))}-{int(round(meta['end']))}{speed_tag}.mp4"
 
 
 def _range_not_satisfiable(file_size: int) -> StreamingResponse:
@@ -144,16 +154,14 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     store = ConfigStore(config_path)
     manager = RecorderManager(store, recordings_dir)
 
-    # Clip exports in flight or waiting to be downloaded, keyed by job id.
-    # Their files live under clips_dir, which is wiped on startup because a
-    # job cannot outlive the process that tracks it.
-    clips_dir = data_dir / "clips"
+    # Export jobs, keyed by job id; what they produce is a saved clip.
+    saved_clips_dir = data_dir / "saved-clips"
     clip_jobs: dict[str, dict] = {}
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        shutil.rmtree(clips_dir, ignore_errors=True)
-        clips_dir.mkdir(parents=True, exist_ok=True)
+        # a job cannot outlive the process that tracks it
+        await asyncio.to_thread(saved_clips.sweep, saved_clips_dir)
         await store.load()
         await manager.start()
         try:
@@ -518,115 +526,178 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if not target.is_file():
             raise HTTPException(status_code=404, detail="not found")
 
-        # An export is a job, not a request: ffmpeg runs in the background
-        # while the client polls for progress, then fetches the finished file.
-        # Holding one HTTP request open for a multi-minute re-encode would run
-        # into any reverse proxy's read timeout and give the user no feedback.
-        # Finished jobs nobody collected are swept on the next start.
+        segment_start = _parse_segment_filename(filename)
+        meta = {
+            "id": secrets.token_urlsafe(8),
+            "stream": name,
+            "source": filename,
+            "start": start,
+            "end": end,
+            # wall clock of the clip's first frame, naive like RecordingFile.started_at
+            "started_at": (
+                (segment_start + timedelta(seconds=start)).isoformat()
+                if segment_start
+                else None
+            ),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            # how far the 1x copy starts before `start`: a stream copy can only
+            # cut on a keyframe
+            "lead": 0.0,
+            "speeds": [],
+        }
+        return _start_export(meta, speed, source=target)
+
+    @app.post("/api/saved-clips/{clip_id}/export", response_model=dict)
+    async def reexport_clip(clip_id: str, speed: float = Query(..., ge=1.0, le=64.0)) -> dict:
+        meta = _saved_clip(clip_id)
+        return _start_export(meta, speed, source=None)
+
+    def _start_export(meta: dict, speed: float, source: Path | None) -> dict:
+        """Run an export as a job: the 1x master from `source` when given, then the `speed` rendition.
+
+        An export is a job, not a request: ffmpeg runs in the background while
+        the client polls for progress. Holding one HTTP request open for a
+        multi-minute re-encode would run into any reverse proxy's read timeout
+        and give the user no feedback.
+        """
         now = time.monotonic()
         for job_id, job in list(clip_jobs.items()):
             if job["state"] != "running" and now - job["finished_at"] > _CLIP_KEEP_SECONDS:
-                job["path"].unlink(missing_ok=True)
                 clip_jobs.pop(job_id, None)
+            elif job["state"] == "running" and (job["clip_id"], job["speed"]) == (meta["id"], speed):
+                return {"id": job_id, **_clip_status(job)}
 
-        stem = filename.rsplit(".", 1)[0]
-        speed_tag = "" if speed <= 1.0 else f"_{speed:g}x"
-        download_name = (
-            f"{stem}_clip_{int(round(start))}-{int(round(end))}{speed_tag}.mp4"
-        )
-        job_id = secrets.token_urlsafe(8)
-        path = clips_dir / f"{job_id}.mp4"
-        out_duration = (end - start) / speed
+        clip_dir = saved_clips_dir / meta["id"]
+        download_name = _clip_download_name(meta, speed)
+        length = meta["end"] - meta["start"]
         base = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-nostats", "-progress", "pipe:1",
         ]
-        trim = ["-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(target)]
-        out = ["-movflags", "+faststart", str(path)]
-        if speed <= 1.0:
-            attempts = [
-                [*base, *trim, "-c", "copy", "-avoid_negative_ts", "make_zero", *out]
-            ]
-        else:
+
+        def out(s: float) -> list[str]:
+            # -f because the .part suffix hides the container from ffmpeg
+            return ["-movflags", "+faststart", "-f", "mp4", str(clip_dir / (saved_clips.rendition_name(s) + saved_clips.TMP_SUFFIX))]
+
+        # (speed, output seconds, ffmpeg attempts in order); attempts are built
+        # when the step runs, since a rendition's trim needs the master's lead
+        steps: list[tuple[float, float, Callable[[], list[list[str]]]]] = []
+        if source is not None:
+            trim = ["-ss", f"{meta['start']:.3f}", "-to", f"{meta['end']:.3f}", "-i", str(source)]
+            steps.append((1.0, length, lambda: [
+                [*base, *trim, "-c", "copy", "-avoid_negative_ts", "make_zero", *out(1.0)]
+            ]))
+        if speed > 1.0 and speed not in meta["speeds"]:
             # Speeding up needs new timestamps, which means a re-encode. Drop
             # audio (useless at Nx) and cap the output at 30fps so high speeds
             # decimate frames instead of encoding every source frame. Every
             # source frame still has to be decoded, and that dominates, so
             # try NVDEC + NVENC first and fall back to the CPU when there is
-            # no usable card.
+            # no usable card. The input is the master, so this works long
+            # after the recording itself is pruned.
+            master = clip_dir / saved_clips.rendition_name(1.0)
             speedup = ["-vf", f"setpts=PTS/{speed:g},fps=30", "-an"]
-            attempts = [
-                [
-                    *base, "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
-                    *trim, *speedup,
-                    "-c:v", "h264_nvenc", "-preset", "p4",
-                    "-rc", "vbr", "-cq", "27", "-b:v", "0",
-                    *out,
-                ],
-                [
-                    *base, *trim, *speedup,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    *out,
-                ],
-            ]
+
+            def rendition_attempts() -> list[list[str]]:
+                trim = ["-ss", f"{meta['lead']:.3f}", "-t", f"{length:.3f}", "-i", str(master)]
+                return [
+                    [
+                        *base, "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+                        *trim, *speedup,
+                        "-c:v", "h264_nvenc", "-preset", "p4",
+                        "-rc", "vbr", "-cq", "27", "-b:v", "0",
+                        *out(speed),
+                    ],
+                    [
+                        *base, *trim, *speedup,
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                        "-pix_fmt", "yuv420p",
+                        *out(speed),
+                    ],
+                ]
+
+            steps.append((speed, length / speed, rendition_attempts))
 
         job: dict = {
-            "state": "running",
-            "progress": 0.0,
+            "state": "running" if steps else "done",
+            "progress": 0.0 if steps else 1.0,
             "error": None,
             "download_name": download_name,
-            "path": path,
+            "clip_id": meta["id"],
+            "speed": speed,
             "proc": None,
-            "finished_at": 0.0,
+            "finished_at": now,
         }
 
         async def run() -> None:
+            current: Path | None = None
             try:
-                for i, args in enumerate(attempts):
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            *args,
-                            stdin=asyncio.subprocess.DEVNULL,
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                    except FileNotFoundError:
-                        job.update(state="error", error="ffmpeg not available")
-                        return
-                    job["proc"] = proc
-                    err_task = asyncio.create_task(proc.stderr.read())
-                    # -progress prints key=value blocks; out_time_us is how much
-                    # of the output exists so far, and it stays N/A until the
-                    # first frame lands. Anything that fails at setup (no GPU,
-                    # bad codec) exits before that, which is when a fallback
-                    # is still safe.
-                    produced = False
-                    async for raw in proc.stdout:
-                        key, _, value = raw.decode(errors="replace").strip().partition("=")
-                        if key == "out_time_us" and value.isdigit():
-                            produced = True
-                            job["progress"] = min(1.0, int(value) / 1_000_000 / out_duration)
-                    await proc.wait()
+                for n, (step_speed, out_duration, make_attempts) in enumerate(steps):
                     if job["state"] == "cancelled":
                         return
-                    if proc.returncode == 0:
-                        job.update(state="done", progress=1.0)
+                    current = clip_dir / (saved_clips.rendition_name(step_speed) + saved_clips.TMP_SUFFIX)
+                    clip_dir.mkdir(parents=True, exist_ok=True)
+                    attempts = make_attempts()
+                    for i, args in enumerate(attempts):
+                        try:
+                            proc = await asyncio.create_subprocess_exec(
+                                *args,
+                                stdin=asyncio.subprocess.DEVNULL,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                        except FileNotFoundError:
+                            job.update(state="error", error="ffmpeg not available")
+                            return
+                        job["proc"] = proc
+                        err_task = asyncio.create_task(proc.stderr.read())
+                        # -progress prints key=value blocks; out_time_us is how much
+                        # of the output exists so far, and it stays N/A until the
+                        # first frame lands. Anything that fails at setup (no GPU,
+                        # bad codec) exits before that, which is when a fallback
+                        # is still safe.
+                        produced = False
+                        async for raw in proc.stdout:
+                            key, _, value = raw.decode(errors="replace").strip().partition("=")
+                            if key == "out_time_us" and value.isdigit():
+                                produced = True
+                                done = min(1.0, int(value) / 1_000_000 / out_duration)
+                                job["progress"] = (n + done) / len(steps)
+                        await proc.wait()
+                        if job["state"] == "cancelled":
+                            return
+                        if proc.returncode == 0:
+                            break
+                        tail = (await err_task).decode(errors="replace").strip().splitlines()[-1:]
+                        detail = tail[0] if tail else "ffmpeg failed"
+                        if not produced and i + 1 < len(attempts):
+                            logger.info("clip %s: GPU path unavailable (%s), using CPU", download_name, detail)
+                            continue
+                        logger.warning("clip %s: %s", download_name, detail)
+                        job.update(state="error", error=f"clip failed: {detail}")
                         return
-                    tail = (await err_task).decode(errors="replace").strip().splitlines()[-1:]
-                    detail = tail[0] if tail else "ffmpeg failed"
-                    if not produced and i + 1 < len(attempts):
-                        logger.info("clip %s: GPU path unavailable (%s), using CPU", download_name, detail)
-                        continue
-                    logger.warning("clip %s: %s", download_name, detail)
-                    job.update(state="error", error=f"clip failed: {detail}")
-                    return
+                    final = clip_dir / saved_clips.rendition_name(step_speed)
+                    current.replace(final)
+                    current = None
+                    if step_speed == 1.0:
+                        got = await probe_duration(final)
+                        meta["lead"] = max(0.0, (got or length) - length)
+                    meta["speeds"] = sorted({*meta["speeds"], step_speed})
+                    await asyncio.to_thread(saved_clips.save, saved_clips_dir, meta)
+                job.update(state="done", progress=1.0)
             finally:
                 job["finished_at"] = time.monotonic()
-                if job["state"] != "done":
-                    path.unlink(missing_ok=True)
+                if current is not None:
+                    current.unlink(missing_ok=True)
+                # a cancelled new export leaves nothing; a failed rendition keeps its master
+                if source is not None and (
+                    job["state"] == "cancelled" or (job["state"] != "done" and not meta["speeds"])
+                ):
+                    saved_clips.delete(saved_clips_dir, meta["id"])
 
-        job["task"] = asyncio.create_task(run())
+        job_id = secrets.token_urlsafe(8)
+        if steps:
+            job["task"] = asyncio.create_task(run())
         clip_jobs[job_id] = job
         return {"id": job_id, **_clip_status(job)}
 
@@ -642,32 +713,81 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         job = clip_jobs.pop(job_id, None)
         if job is None:
             raise HTTPException(status_code=404, detail="no such export")
+        _cancel_job(job)
+        return {"ok": True}
+
+    def _cancel_job(job: dict) -> None:
         if job["state"] == "running":
             job["state"] = "cancelled"
             if job["proc"] is not None and job["proc"].returncode is None:
                 job["proc"].kill()
-        else:
-            job["path"].unlink(missing_ok=True)
+
+    # ---- saved clips ----
+
+    def _saved_clip(clip_id: str) -> dict:
+        meta = saved_clips.load(saved_clips_dir, clip_id) if _CLIP_ID_RE.match(clip_id) else None
+        if meta is None:
+            raise HTTPException(status_code=404, detail="no such clip")
+        return meta
+
+    @app.get("/api/saved-clips", response_model=list)
+    async def list_saved_clips() -> list:
+        out = []
+        for meta in await asyncio.to_thread(saved_clips.list_all, saved_clips_dir):
+            clip_dir = saved_clips_dir / meta["id"]
+            renditions = []
+            for s in meta["speeds"]:
+                try:
+                    size = (clip_dir / saved_clips.rendition_name(s)).stat().st_size
+                except OSError:
+                    continue
+                renditions.append({"speed": s, "size": size})
+            stream_dir = recordings_dir / meta["stream"]
+            out.append({
+                "id": meta["id"],
+                "stream": meta["stream"],
+                "source": meta["source"],
+                "start": meta["start"],
+                "end": meta["end"],
+                "started_at": meta.get("started_at"),
+                "created_at": meta["created_at"],
+                "source_exists": (stream_dir / meta["source"]).is_file(),
+                "renditions": renditions,
+            })
+        return out
+
+    @app.get("/api/saved-clips/{clip_id}/{speed}x.mp4")
+    async def saved_clip_file(clip_id: str, speed: float, download: bool = False):
+        meta = _saved_clip(clip_id)
+        path = saved_clips_dir / clip_id / saved_clips.rendition_name(speed)
+        if speed not in meta["speeds"] or not path.is_file():
+            raise HTTPException(status_code=404, detail="no such rendition")
+        return FileResponse(
+            path,
+            media_type="video/mp4",
+            filename=_clip_download_name(meta, speed) if download else None,
+        )
+
+    @app.delete("/api/saved-clips/{clip_id}", response_model=dict)
+    async def delete_saved_clip(clip_id: str) -> dict:
+        _saved_clip(clip_id)
+        for job in clip_jobs.values():
+            if job["clip_id"] == clip_id:
+                _cancel_job(job)
+        await asyncio.to_thread(saved_clips.delete, saved_clips_dir, clip_id)
         return {"ok": True}
 
-    @app.get("/api/clips/{job_id}/download")
-    async def download_clip(job_id: str):
-        job = clip_jobs.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="no such export")
-        if job["state"] != "done":
-            raise HTTPException(status_code=409, detail=f"export is {job['state']}")
-
-        def _cleanup() -> None:
-            job["path"].unlink(missing_ok=True)
-            clip_jobs.pop(job_id, None)
-
-        return FileResponse(
-            job["path"],
-            media_type="video/mp4",
-            filename=job["download_name"],
-            background=BackgroundTask(_cleanup),
-        )
+    @app.delete("/api/saved-clips/{clip_id}/{speed}x", response_model=dict)
+    async def delete_saved_rendition(clip_id: str, speed: float) -> dict:
+        meta = _saved_clip(clip_id)
+        if speed == 1.0:
+            raise HTTPException(status_code=400, detail="the 1x copy is the clip; delete the clip instead")
+        if speed not in meta["speeds"]:
+            raise HTTPException(status_code=404, detail="no such rendition")
+        meta["speeds"] = [s for s in meta["speeds"] if s != speed]
+        await asyncio.to_thread(saved_clips.save, saved_clips_dir, meta)
+        (saved_clips_dir / clip_id / saved_clips.rendition_name(speed)).unlink(missing_ok=True)
+        return {"ok": True}
 
     # ---- retention / config ----
 
