@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Film, Video, X } from "lucide-react";
+import { AlertTriangle, Film, Settings, Video, X } from "lucide-react";
 import type { SavedClip, ServiceStatus } from "./types";
 import { api } from "./api";
 import { Header } from "./components/Header";
@@ -24,7 +24,8 @@ function Dashboard() {
   const [addOpen, setAddOpen] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [showClips, setShowClips] = useState(false);
+  // what the main pane shows; "stream" means the selected stream
+  const [view, setView] = useState<"stream" | "clips" | "settings">("stream");
   const [openRequest, setOpenRequest] = useState<{
     file: string;
     start: number;
@@ -101,7 +102,7 @@ function Dashboard() {
 
   const selectStream = useCallback((name: string) => {
     setSelected(name);
-    setShowClips(false);
+    setView("stream");
     // On mobile the list lives in an overlay drawer; picking a stream should
     // dismiss it so the detail is visible. No-op on desktop where it's static.
     setDrawerOpen(false);
@@ -143,7 +144,7 @@ function Dashboard() {
           />
         )}
         <aside
-          className={`border-white/[0.06] flex flex-col min-h-0 overflow-y-auto bg-ink-900
+          className={`border-white/[0.06] flex flex-col min-h-0 bg-ink-900
             fixed inset-y-0 left-0 z-40 w-[85%] max-w-xs border-r shadow-2xl
             transform transition-transform duration-200 ease-out
             ${drawerOpen ? "translate-x-0" : "-translate-x-full"}
@@ -159,27 +160,34 @@ function Dashboard() {
               <X size={18} />
             </button>
           </div>
-          <div className="px-2 pt-2">
-            <button
-              onClick={() => {
-                setShowClips(true);
-                setDrawerOpen(false);
-              }}
-              className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium border transition-colors ${
-                showClips
-                  ? "bg-accent/10 border-accent/30 text-ink-50"
-                  : "border-transparent text-ink-200 hover:bg-white/[0.04]"
-              }`}
-            >
-              <Film size={15} className="text-accent" />
-              Saved clips
-            </button>
-          </div>
-          {/* never squeezed: the cards below scroll with the sidebar instead */}
-          <div className="flex-auto shrink-0">
+          <nav className="px-2 pt-2 space-y-1">
+            {(
+              [
+                ["clips", "Saved clips", Film],
+                ["settings", "Settings", Settings],
+              ] as const
+            ).map(([key, label, Icon]) => (
+              <button
+                key={key}
+                onClick={() => {
+                  setView(key);
+                  setDrawerOpen(false);
+                }}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium border transition-colors ${
+                  view === key
+                    ? "bg-accent/10 border-accent/30 text-ink-50"
+                    : "border-transparent text-ink-200 hover:bg-white/[0.04]"
+                }`}
+              >
+                <Icon size={15} className="text-accent" />
+                {label}
+              </button>
+            ))}
+          </nav>
+          <div className="flex-1 min-h-0">
             <StreamList
               streams={status?.streams ?? []}
-              selected={showClips ? null : selected}
+              selected={view === "stream" ? selected : null}
               onSelect={selectStream}
               onAdd={() => {
                 setDrawerOpen(false);
@@ -187,34 +195,44 @@ function Dashboard() {
               }}
             />
           </div>
-          {status && (
-            <>
-              <SegmentLengthCard
-                segmentSeconds={status.segment_seconds}
-                onUpdate={refresh}
-              />
-              <TimezoneCard
-                timezone={status.timezone}
-                onUpdate={refresh}
-              />
-              <RetentionCard
-                retentionDays={status.retention_days}
-                onUpdate={refresh}
-              />
-              <IdleRetentionCard
-                idleRetentionDays={status.idle_retention_days}
-                retentionDays={status.retention_days}
-                onUpdate={refresh}
-              />
-              <MotionThresholdCard
-                motionThreshold={status.motion_threshold}
-                onUpdate={refresh}
-              />
-            </>
-          )}
         </aside>
         <section className="min-h-0 overflow-hidden">
-          {showClips ? (
+          {view === "settings" && status ? (
+            <div className="h-full overflow-y-auto">
+              <div className="px-4 sm:px-6 py-5 border-b border-white/[0.06]">
+                <div className="flex items-center gap-2.5">
+                  <Settings size={18} className="text-accent" />
+                  <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
+                </div>
+                <p className="text-sm text-ink-400 mt-1">
+                  Apply to every stream.
+                </p>
+              </div>
+              <div className="px-4 sm:px-6 py-5">
+                {/* the cards draw their own top rule, which the first one doesn't need */}
+                <div className="card max-w-2xl overflow-hidden [&>div:first-child]:border-t-0">
+                  <SegmentLengthCard
+                    segmentSeconds={status.segment_seconds}
+                    onUpdate={refresh}
+                  />
+                  <TimezoneCard timezone={status.timezone} onUpdate={refresh} />
+                  <RetentionCard
+                    retentionDays={status.retention_days}
+                    onUpdate={refresh}
+                  />
+                  <IdleRetentionCard
+                    idleRetentionDays={status.idle_retention_days}
+                    retentionDays={status.retention_days}
+                    onUpdate={refresh}
+                  />
+                  <MotionThresholdCard
+                    motionThreshold={status.motion_threshold}
+                    onUpdate={refresh}
+                  />
+                </div>
+              </div>
+            </div>
+          ) : view === "clips" ? (
             <SavedClips
               onOpenSource={(clip: SavedClip) => {
                 selectStream(clip.stream);

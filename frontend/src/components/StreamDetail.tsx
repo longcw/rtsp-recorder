@@ -250,7 +250,9 @@ export function StreamDetail({
   const totalSize = (files ?? []).reduce((a, b) => a + b.size, 0);
 
   return (
-    <div className="h-full flex flex-col">
+    // On a short window the page scrolls as a whole rather than squeezing the
+    // recordings table below a usable height.
+    <div className="h-full flex flex-col overflow-y-auto">
       <div className="px-4 sm:px-6 py-5 border-b border-white/[0.06]">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
@@ -324,7 +326,7 @@ export function StreamDetail({
         )}
       </div>
 
-      <div className="flex-1 min-h-0 px-4 sm:px-6 py-5 flex flex-col">
+      <div className="flex-1 min-h-[26rem] px-4 sm:px-6 py-5 flex flex-col">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-ink-200">Recordings</h2>
           <div className="flex items-center gap-1.5">
