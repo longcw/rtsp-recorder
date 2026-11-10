@@ -3,12 +3,13 @@
 The live segment is a fragmented MP4 (see ``faststart``) whose header carries
 no duration and no fragment index, so a browser's demuxer walks every
 ``moof`` in the file before playout — on a near-full hourly segment that is
-the whole ~250 MB. A ``sidx`` box covering every fragment gives it the
-duration and seek points up front, so it stops after the first fragment and
-range-requests only what it plays, like a finalized (faststart) file.
+the whole ~250 MB. One ``sidx`` box per track, covering every fragment, gives it
+the duration and seek points up front, so it stops after the first fragment
+and range-requests only what it plays, like a finalized (faststart) file. A
+track without one makes ffmpeg re-read every fragment from the start on seek.
 
 The view is a snapshot cut at a fragment boundary: ``ftyp`` + ``moov``, the
-built ``sidx``, then every complete ``moof``/``mdat`` pair below a byte
+built ``sidx`` boxes, then every complete ``moof``/``mdat`` pair below a byte
 limit. The client names that limit, so every range request against one
 snapshot sees the same bytes while ffmpeg keeps appending. Fragment data
 offsets are relative to their ``moof`` (``default_base_moof``), so inserting
@@ -52,8 +53,8 @@ def _boxes(f: BinaryIO, start: int, end: int):
         pos += size
 
 
-def _read_moov(f: BinaryIO, start: int, end: int) -> tuple[int, int, int] | None:
-    """Return ``(track_id, timescale, trex default duration)`` of the video track."""
+def _read_moov(f: BinaryIO, start: int, end: int) -> list[tuple[int, int, int]] | None:
+    """Return ``(track_id, timescale, trex default duration)`` per track, video last."""
     tracks: list[dict] = []
     trex: dict[int, int] = {}
 
@@ -80,14 +81,18 @@ def _read_moov(f: BinaryIO, start: int, end: int) -> tuple[int, int, int] | None
                 trex[track_id] = duration
 
     walk(start, end, None)
-    for t in tracks:
-        if t.get("handler") == b"vide" and "id" in t and t.get("timescale"):
-            return t["id"], t["timescale"], trex.get(t["id"], 0)
-    return None
+    tracks = [t for t in tracks if "id" in t and t.get("timescale")]
+    if not any(t.get("handler") == b"vide" for t in tracks):
+        return None
+    # ffmpeg marks the index complete only at a sidx with first_offset 0, the last one; put video there
+    tracks.sort(key=lambda t: t.get("handler") == b"vide")
+    return [(t["id"], t["timescale"], trex.get(t["id"], 0)) for t in tracks]
 
 
-def _read_fragment(moof: bytes, track_id: int, trex_duration: int) -> tuple[int, int] | None:
-    """Return ``(base decode time, duration)`` of the video track in one ``moof``."""
+def _read_fragment(moof: bytes, tracks: list[tuple[int, int, int]]) -> tuple[tuple[int, int], ...] | None:
+    """Return ``(base decode time, duration)`` per track in one ``moof``."""
+    defaults = {track_id: trex_duration for track_id, _, trex_duration in tracks}
+    timing: dict[int, tuple[int, int]] = {}
     pos = 8
     while pos + 8 <= len(moof):
         size, box_type = struct.unpack_from(">I4s", moof, pos)
@@ -96,7 +101,7 @@ def _read_fragment(moof: bytes, track_id: int, trex_duration: int) -> tuple[int,
         if box_type == b"traf":
             traf = moof[pos + 8 : pos + size]
             tfhd_id = base = None
-            default_duration = trex_duration
+            default_duration = 0
             duration = 0
             p = 0
             while p + 8 <= len(traf):
@@ -107,8 +112,9 @@ def _read_fragment(moof: bytes, track_id: int, trex_duration: int) -> tuple[int,
                 flags = int.from_bytes(body[1:4], "big")
                 if btype == b"tfhd":
                     tfhd_id = struct.unpack_from(">I", body, 4)[0]
-                    if tfhd_id != track_id:
+                    if tfhd_id not in defaults:
                         break
+                    default_duration = defaults[tfhd_id]
                     off = 8 + (8 if flags & 0x01 else 0) + (4 if flags & 0x02 else 0)
                     if flags & 0x08:
                         default_duration = struct.unpack_from(">I", body, off)[0]
@@ -125,10 +131,12 @@ def _read_fragment(moof: bytes, track_id: int, trex_duration: int) -> tuple[int,
                     else:
                         duration += count * default_duration
                 p += bsize
-            if tfhd_id == track_id and base is not None:
-                return base, duration
+            if tfhd_id in defaults and base is not None:
+                timing[tfhd_id] = (base, duration)
         pos += size
-    return None
+    if len(timing) != len(tracks):
+        return None
+    return tuple(timing[track_id] for track_id, _, _ in tracks)
 
 
 @dataclass
@@ -136,62 +144,68 @@ class LiveIndex:
     """Complete fragments of a live segment, below a byte limit."""
 
     head_end: int  # end of the moov; the first moof starts here
-    track_id: int
-    timescale: int
-    # (start, end, base decode time, duration) per moof/mdat pair
-    fragments: list[tuple[int, int, int, int]]
+    # (track id, timescale) per track, video last
+    tracks: list[tuple[int, int]]
+    # (start, end, (base decode time, duration) per track) per moof/mdat pair
+    fragments: list[tuple[int, int, tuple[tuple[int, int], ...]]]
 
     @property
     def seconds(self) -> float:
-        last = self.fragments[-1]
-        return (last[2] + last[3] - self.fragments[0][2]) / self.timescale
+        first, last = self.fragments[0][2][-1], self.fragments[-1][2][-1]
+        return (last[0] + last[1] - first[0]) / self.tracks[-1][1]
 
     def view(self) -> tuple[list[Piece], int]:
         """Return the pieces of the indexed file and its total size."""
         frags = self.fragments
-        # durations come from consecutive decode times, the last from its samples
-        refs = b"".join(
-            struct.pack(
-                ">III",
-                end - start,
-                (frags[i + 1][2] - base) if i + 1 < len(frags) else duration,
-                0x90000000,  # starts_with_SAP=1, SAP type 1
+        bodies = []
+        for t, (track_id, timescale) in enumerate(self.tracks):
+            # durations come from consecutive decode times, the last from its samples
+            refs = b"".join(
+                struct.pack(
+                    ">III",
+                    end - start,
+                    (frags[i + 1][2][t][0] - timing[t][0]) if i + 1 < len(frags) else timing[t][1],
+                    0x90000000,  # starts_with_SAP=1, SAP type 1
+                )
+                for i, (start, end, timing) in enumerate(frags)
             )
-            for i, (start, end, base, duration) in enumerate(frags)
-        )
-        body = (
-            struct.pack(">I", 1 << 24)  # version 1, flags 0
-            + struct.pack(">IIQQHH", self.track_id, self.timescale, frags[0][2], 0, 0, len(frags))
+            bodies.append((track_id, timescale, frags[0][2][t][0], refs))
+        # each sidx's first_offset skips the sidx boxes after it, so all point at the first moof
+        sizes = [8 + 4 + 28 + len(refs) for *_, refs in bodies]
+        boxes = b"".join(
+            struct.pack(">I4s", size, b"sidx")
+            + struct.pack(">I", 1 << 24)  # version 1, flags 0
+            + struct.pack(">IIQQHH", track_id, timescale, earliest, sum(sizes[i + 1 :]), 0, len(frags))
             + refs
+            for i, (size, (track_id, timescale, earliest, refs)) in enumerate(zip(sizes, bodies))
         )
-        box = struct.pack(">I4s", 8 + len(body), b"sidx") + body
         tail = frags[-1][1]
-        return [(0, self.head_end), box, (self.head_end, tail - self.head_end)], tail + len(box)
+        return [(0, self.head_end), boxes, (self.head_end, tail - self.head_end)], tail + len(boxes)
 
 
 def read_index(path: Path, limit: int) -> LiveIndex | None:
     """Index the fragments below ``limit``, or None if the file is not fragmented."""
     with open(path, "rb") as f:
         head_end = None
-        track = None
-        fragments: list[tuple[int, int, int, int]] = []
-        pending: tuple[int, int, int] | None = None  # moof awaiting its mdat
+        tracks = None
+        fragments: list[tuple[int, int, tuple[tuple[int, int], ...]]] = []
+        pending: tuple[int, tuple[tuple[int, int], ...]] | None = None  # moof awaiting its mdat
         for box_type, start, payload, end in _boxes(f, 0, limit):
             if end > limit:
                 break
             if box_type == b"moov":
-                track = _read_moov(f, payload, end)
+                tracks = _read_moov(f, payload, end)
                 head_end = end
             elif box_type == b"moof":
-                if track is None:
+                if tracks is None:
                     return None
                 f.seek(start)
-                info = _read_fragment(f.read(end - start), track[0], track[2])
-                if info is None:
+                timing = _read_fragment(f.read(end - start), tracks)
+                if timing is None:
                     return None
-                pending = (start, *info)
+                pending = (start, timing)
             elif box_type == b"mdat" and pending is not None:
-                fragments.append((pending[0], end, pending[1], pending[2]))
+                fragments.append((pending[0], end, pending[1]))
                 pending = None
             elif head_end is None:
                 continue
@@ -199,8 +213,8 @@ def read_index(path: Path, limit: int) -> LiveIndex | None:
                 # e.g. the mfra ffmpeg appends when it closes the segment
                 break
 
-    if head_end is None or track is None or not fragments or len(fragments) > 0xFFFF:
+    if head_end is None or tracks is None or not fragments or len(fragments) > 0xFFFF:
         return None
     if fragments[0][0] != head_end:
         return None
-    return LiveIndex(head_end, track[0], track[1], fragments)
+    return LiveIndex(head_end, [(t[0], t[1]) for t in tracks], fragments)

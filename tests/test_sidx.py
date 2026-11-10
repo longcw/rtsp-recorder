@@ -80,6 +80,26 @@ class LiveViewTest(unittest.TestCase):
             check=True,
         )
 
+    def test_seek_skips_earlier_fragments(self) -> None:
+        pieces, _ = sidx.read_index(self.src, self.src.stat().st_size * 3 // 4).view()
+        view = self.dir / "view.mp4"
+        _materialize(self.src, pieces, view)
+
+        def seek_read(seconds: int) -> int:
+            out = subprocess.run(
+                ["ffmpeg", "-v", "debug", "-ss", str(seconds), "-i", str(view),
+                 "-frames:v", "1", "-f", "null", "-"],
+                capture_output=True, text=True, check=True,
+            )
+            return next(
+                int(line.split("Statistics: ")[1].split(" bytes")[0])
+                for line in out.stderr.splitlines()
+                if "Statistics:" in line and "bytes read" in line
+            )
+
+        # a late seek jumps to its fragment for every track instead of walking there
+        self.assertLess(seek_read(13), seek_read(2) * 3 // 2)
+
     def test_finalized_file_is_left_alone(self) -> None:
         plain = self.dir / "plain.mp4"
         subprocess.run(
